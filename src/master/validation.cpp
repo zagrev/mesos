@@ -518,10 +518,32 @@ Option<Error> validateFrameworkId(const FrameworkInfo& frameworkInfo)
   return common::validation::validateID(frameworkInfo.id().value());
 }
 
+
+Option<Error> validateOfferFilters(const FrameworkInfo& frameworkInfo)
+{
+  // Use `auto` in place of `protobuf::MapPair<string, Value::Scalar>`
+  // below since `foreach` is a macro and cannot contain angle brackets.
+  foreach (auto&& filter, frameworkInfo.offer_filters()) {
+    const OfferFilters& offerFilters = filter.second;
+
+    Option<Error> error =
+      common::validation::validateOfferFilters(offerFilters);
+
+    if (error.isSome()) {
+      return error;
+    }
+  }
+
+  return None();
+}
+
 } // namespace internal {
+
 
 Option<Error> validate(const mesos::FrameworkInfo& frameworkInfo)
 {
+  // TODO(jay_guo): This currently only validates the role(s),
+  // framework ID and offer filters, validate more fields!
   Option<Error> error = internal::validateRoles(frameworkInfo);
 
   if (error.isSome()) {
@@ -529,6 +551,12 @@ Option<Error> validate(const mesos::FrameworkInfo& frameworkInfo)
   }
 
   error = internal::validateFrameworkId(frameworkInfo);
+
+  if (error.isSome()) {
+    return error;
+  }
+
+  error = internal::validateOfferFilters(frameworkInfo);
 
   if (error.isSome()) {
     return error;
@@ -951,6 +979,13 @@ Option<Error> validateExecutorID(const ExecutorInfo& executor)
 
 Option<Error> validateType(const ExecutorInfo& executor)
 {
+  if (executor.has_container()) {
+    Option<Error> unionError =
+      protobuf::validateProtobufUnion(executor.container());
+    if (unionError.isSome()) {
+      return unionError;
+    }
+  }
   switch (executor.type()) {
     case ExecutorInfo::DEFAULT:
       if (executor.has_command()) {
@@ -2568,8 +2603,20 @@ Option<Error> validate(const Offer::Operation::DestroyDisk& destroyDisk)
   }
 
   if (!Resources::isDisk(source, Resource::DiskInfo::Source::MOUNT) &&
-      !Resources::isDisk(source, Resource::DiskInfo::Source::BLOCK)) {
-    return Error("'source' is neither a MOUNT or BLOCK disk resource");
+      !Resources::isDisk(source, Resource::DiskInfo::Source::BLOCK) &&
+      !Resources::isDisk(source, Resource::DiskInfo::Source::RAW)) {
+    return Error("'source' is neither a MOUNT, BLOCK or RAW disk resource");
+  }
+
+  if (!source.disk().source().has_id()) {
+    return Error("'source' is not backed by a CSI volume");
+  }
+
+  if (Resources::isPersistentVolume(source)) {
+    return Error(
+        "A disk resource containing a persistent volume " + stringify(source) +
+        " cannot be destroyed directly. Please destroy the persistent volume"
+        " first then destroy the disk resource");
   }
 
   return None();

@@ -69,6 +69,7 @@ const char RESOURCES_INFO_FILE[] = "resources.info";
 const char RESOURCES_TARGET_FILE[] = "resources.target";
 const char RESOURCE_PROVIDER_STATE_FILE[] = "resource_provider.state";
 const char OPERATION_UPDATES_FILE[] = "operation.updates";
+const char VOLUME_GIDS_FILE[] = "volume_gids";
 
 
 const char CONTAINERS_DIR[] = "containers";
@@ -557,11 +558,28 @@ Try<list<string>> getOperationPaths(
 }
 
 
+Try<list<string>> getSlaveOperationPaths(
+    const string& metaDir,
+    const SlaveID& slaveId)
+{
+  return getOperationPaths(getSlavePath(metaDir, slaveId));
+}
+
+
 string getOperationPath(
     const string& rootDir,
     const id::UUID& operationUuid)
 {
   return path::join(rootDir, OPERATIONS_DIR, operationUuid.toString());
+}
+
+
+string getSlaveOperationPath(
+    const string& metaDir,
+    const SlaveID& slaveId,
+    const id::UUID& operationUuid)
+{
+  return getOperationPath(getSlavePath(metaDir, slaveId), operationUuid);
 }
 
 
@@ -592,6 +610,15 @@ Try<id::UUID> parseOperationPath(
 }
 
 
+Try<id::UUID> parseSlaveOperationPath(
+    const string& metaDir,
+    const SlaveID& slaveId,
+    const string& dir)
+{
+  return parseOperationPath(getSlavePath(metaDir, slaveId), dir);
+}
+
+
 string getOperationUpdatesPath(
     const string& rootDir,
     const id::UUID& operationUuid)
@@ -599,6 +626,15 @@ string getOperationUpdatesPath(
   return path::join(
       getOperationPath(rootDir, operationUuid),
       OPERATION_UPDATES_FILE);
+}
+
+
+string getSlaveOperationUpdatesPath(
+    const string& metaDir,
+    const SlaveID& slaveId,
+    const id::UUID& operationUuid)
+{
+  return getOperationUpdatesPath(getSlavePath(metaDir, slaveId), operationUuid);
 }
 
 
@@ -733,6 +769,12 @@ string getPersistentVolumePath(
   }
 
   UNREACHABLE();
+}
+
+
+string getVolumeGidsPath(const string& rootDir)
+{
+  return path::join(rootDir, "volume_gid_manager", VOLUME_GIDS_FILE);
 }
 
 

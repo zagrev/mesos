@@ -14,68 +14,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef __CSI_UTILS_HPP__
-#define __CSI_UTILS_HPP__
+#ifndef __CSI_V0_UTILS_HPP__
+#define __CSI_V0_UTILS_HPP__
 
-#include <ostream>
-#include <type_traits>
-
-#include <csi/spec.hpp>
-
-#include <google/protobuf/map.h>
-
-#include <google/protobuf/util/json_util.h>
-
-#include <mesos/mesos.hpp>
+#include <mesos/csi/types.hpp>
+#include <mesos/csi/v0.hpp>
 
 #include <stout/foreach.hpp>
-#include <stout/try.hpp>
 #include <stout/unreachable.hpp>
-
-#include "csi/state.hpp"
-
-namespace csi {
-namespace v0 {
-
-bool operator==(
-    const ControllerServiceCapability& left,
-    const ControllerServiceCapability& right);
-
-
-bool operator==(const VolumeCapability& left, const VolumeCapability& right);
-
-
-inline bool operator!=(
-    const VolumeCapability& left,
-    const VolumeCapability& right)
-{
-  return !(left == right);
-}
-
-
-std::ostream& operator<<(
-    std::ostream& stream,
-    const ControllerServiceCapability::RPC::Type& type);
-
-
-// Default imprementation for output protobuf messages in namespace
-// `csi`. Note that any non-template overloading of the output operator
-// would take precedence over this function template.
-template <
-    typename Message,
-    typename std::enable_if<std::is_convertible<
-        Message*, google::protobuf::Message*>::value, int>::type = 0>
-std::ostream& operator<<(std::ostream& stream, const Message& message)
-{
-  // NOTE: We use Google's JSON utility functions for proto3.
-  std::string output;
-  google::protobuf::util::MessageToJsonString(message, &output);
-  return stream << output;
-}
-
-} // namespace v0 {
-} // namespace csi {
-
 
 namespace mesos {
 namespace csi {
@@ -176,8 +122,16 @@ struct NodeCapabilities
   bool stageUnstageVolume = false;
 };
 
+
+// Helpers to devolve CSI v0 protobufs to their unversioned counterparts.
+types::VolumeCapability devolve(const VolumeCapability& capability);
+
+
+// Helpers to evolve unversioned CSI protobufs to their v0 counterparts.
+VolumeCapability evolve(const types::VolumeCapability& capability);
+
 } // namespace v0 {
 } // namespace csi {
 } // namespace mesos {
 
-#endif // __CSI_UTILS_HPP__
+#endif // __CSI_V0_UTILS_HPP__

@@ -199,14 +199,11 @@ void RandomSorter::remove(const string& clientPath)
 
     // Update `parent` to reflect the fact that the resources in the
     // leaf node are no longer allocated to the subtree rooted at
-    // `parent`. We skip `root`, because we never update the
-    // allocation made to the root node.
-    if (parent != root) {
-      foreachpair (const SlaveID& slaveId,
-                   const Resources& resources,
-                   leafAllocation) {
-        parent->allocation.subtract(slaveId, resources);
-      }
+    // `parent`.
+    foreachpair (const SlaveID& slaveId,
+                 const Resources& resources,
+                 leafAllocation) {
+      parent->allocation.subtract(slaveId, resources);
     }
 
     if (current->children.empty()) {
@@ -313,12 +310,9 @@ void RandomSorter::allocated(
 {
   Node* current = CHECK_NOTNULL(find(clientPath));
 
-  // NOTE: We don't currently update the `allocation` for the root
-  // node. This is debatable, but the current implementation doesn't
-  // require looking at the allocation of the root node.
-  while (current != root) {
+  while (current != nullptr) {
     current->allocation.add(slaveId, resources);
-    current = CHECK_NOTNULL(current->parent);
+    current = current->parent;
   }
 }
 
@@ -334,12 +328,9 @@ void RandomSorter::update(
 
   Node* current = CHECK_NOTNULL(find(clientPath));
 
-  // NOTE: We don't currently update the `allocation` for the root
-  // node. This is debatable, but the current implementation doesn't
-  // require looking at the allocation of the root node.
-  while (current != root) {
+  while (current != nullptr) {
     current->allocation.update(slaveId, oldAllocation, newAllocation);
-    current = CHECK_NOTNULL(current->parent);
+    current = current->parent;
   }
 }
 
@@ -351,12 +342,9 @@ void RandomSorter::unallocated(
 {
   Node* current = CHECK_NOTNULL(find(clientPath));
 
-  // NOTE: We don't currently update the `allocation` for the root
-  // node. This is debatable, but the current implementation doesn't
-  // require looking at the allocation of the root node.
-  while (current != root) {
+  while (current != nullptr) {
     current->allocation.subtract(slaveId, resources);
-    current = CHECK_NOTNULL(current->parent);
+    current = current->parent;
   }
 }
 
@@ -369,11 +357,17 @@ const hashmap<SlaveID, Resources>& RandomSorter::allocation(
 }
 
 
-const Resources& RandomSorter::allocationScalarQuantities(
+const ResourceQuantities& RandomSorter::allocationScalarQuantities(
     const string& clientPath) const
 {
   const Node* client = CHECK_NOTNULL(find(clientPath));
-  return client->allocation.scalarQuantities;
+  return client->allocation.totals;
+}
+
+
+const ResourceQuantities& RandomSorter::allocationScalarQuantities() const
+{
+  return root->allocation.totals;
 }
 
 
@@ -418,9 +412,9 @@ Resources RandomSorter::allocation(
 }
 
 
-const Resources& RandomSorter::totalScalarQuantities() const
+const ResourceQuantities& RandomSorter::totalScalarQuantities() const
 {
-  return total_.scalarQuantities;
+  return total_.totals;
 }
 
 
@@ -436,14 +430,11 @@ void RandomSorter::add(const SlaveID& slaveId, const Resources& resources)
 
     total_.resources[slaveId] += resources;
 
-    const Resources scalarQuantities =
-      (resources.nonShared() + newShared).createStrippedScalarQuantity();
+    const ResourceQuantities scalarQuantities =
+      ResourceQuantities::fromScalarResources(
+          (resources.nonShared() + newShared).scalars());
 
-    total_.scalarQuantities += scalarQuantities;
-
-    foreach (const Resource& resource, scalarQuantities) {
-      total_.totals[resource.name()] += resource.scalar();
-    }
+    total_.totals += scalarQuantities;
   }
 }
 
@@ -464,15 +455,12 @@ void RandomSorter::remove(const SlaveID& slaveId, const Resources& resources)
         return !total_.resources[slaveId].contains(resource);
       });
 
-    const Resources scalarQuantities =
-      (resources.nonShared() + absentShared).createStrippedScalarQuantity();
+    const ResourceQuantities scalarQuantities =
+      ResourceQuantities::fromScalarResources(
+          (resources.nonShared() + absentShared).scalars());
 
-    foreach (const Resource& resource, scalarQuantities) {
-      total_.totals[resource.name()] -= resource.scalar();
-    }
-
-    CHECK(total_.scalarQuantities.contains(scalarQuantities));
-    total_.scalarQuantities -= scalarQuantities;
+    CHECK(total_.totals.contains(scalarQuantities));
+    total_.totals -= scalarQuantities;
 
     if (total_.resources[slaveId].empty()) {
       total_.resources.erase(slaveId);

@@ -137,8 +137,6 @@ NOTE: Mesos will cap `Filters.refuse_seconds` at 31536000 seconds (365 days).
 
 The master will send task status updates in response to `LAUNCH` and `LAUNCH_GROUP` operations. For other types of operations, if an operation ID is specified, the master will send operation status updates in response.
 
-NOTE: For the time being, an operation ID can only be set if the operation affects resources provided by a [resource provider](csi.md#resource-providers). See [MESOS-8194](https://issues.apache.org/jira/browse/MESOS-8371) for more details.
-
 ```
 ACCEPT Request (JSON):
 POST /api/v1/scheduler  HTTP/1.1
@@ -387,7 +385,7 @@ HTTP/1.1 202 Accepted
 ```
 
 ### RECONCILE_OPERATIONS
-Sent by the scheduler to query the status of non-terminal operations. The master will respond with a `RECONCILE_OPERATIONS` response containing the status of each operation in the list. If the list of operations is empty, the master will include in the response all currently known operations of the framework.
+Sent by the scheduler to query the status of non-terminal and terminal-but-unacknowledged operations. This causes the master to send back `UPDATE_OPERATION_STATUS` events for each operation in the list. If the list of operations is empty, the master will send events for all currently known operations of the framework.
 
 ```
 RECONCILE_OPERATIONS Request (JSON):
@@ -405,29 +403,15 @@ Mesos-Stream-Id: 130ae4e3-6b13-4ef4-baa9-9f2e85c3e9af
     "operations": [
       {
         "operation_id": { "value": "312325" },
-        "agent_id": { "value": "123535" }
+        "agent_id": { "value": "123535" },
+        "resource_provider_id": { "value": "927695" }
       }
     ]
   }
 }
 
 RECONCILE_OPERATIONS Response:
-HTTP/1.1 200 Accepted
-
-Content-Type: application/json
-
-{
-  "type": "RECONCILE_OPERATIONS",
-  "reconcile_operations": {
-    "operation_statuses": [
-      {
-        "operation_id": { "value": "312325" },
-        "state": "OPERATION_PENDING",
-        "uuid": "adfadfadbhgvjayd23r2uahj"
-      }
-    ]
-  }
-}
+HTTP/1.1 202 Accepted
 
 ```
 
@@ -592,6 +576,27 @@ UPDATE Event (JSON)
         "source"	: "SOURCE_EXECUTOR",
         "uuid"		: "adfadfadbhgvjayd23r2uahj",
         "bytes"		: "uhdjfhuagdj63d7hadkf"
+      }
+  }
+}
+```
+
+### UPDATE_OPERATION_STATUS
+Sent by the master whenever there is an update to the state of an operation for which the scheduler requested feedback by setting the operation's `id` field. It is the responsibility of the scheduler to explicitly acknowledge the receipt of any status updates which have their `uuid` field set, as this indicates that the update will be retried until acknowledgement is received. This ensures that such updates are delivered reliably. See `ACKNOWLEDGE_OPERATION_STATUS` in the Calls section above for the relevant acknowledgement semantics. Note that the `uuid` field contains raw bytes encoded in Base64.
+
+```
+UPDATE_OPERATION_STATUS Event (JSON)
+
+<event-length>
+{
+  "type"	: "UPDATE_OPERATION_STATUS",
+  "update_operation_status"	: {
+    "status"	: {
+        "operation_id" : { "value" : "operation-1234"},
+        "state"        : "OPERATION_FAILED",
+        "uuid"         : "adfadfadbhgvjayd23r2uahj",
+        "agent_id"     : { "value" : "12214-23523-S235235"},
+        "resource_provider_id" : { "value" : "83978-17885-1089645"}
       }
   }
 }

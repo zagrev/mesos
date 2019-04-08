@@ -22,6 +22,7 @@
 #include <vector>
 
 #include <mesos/mesos.hpp>
+#include <mesos/resources.hpp>
 
 #include <stout/try.hpp>
 
@@ -29,32 +30,20 @@ namespace mesos {
 namespace internal {
 
 
-// An efficient collection of resource quantities.
+// An efficient collection of resource quantities. All values are guaranteed
+// to be positive and finite.
 //
-// E.g. [("cpus", 4.5), ("gpus", 0), ("ports", 1000)]
+// E.g. [("cpus", 4.5), ("gpus", 0.1), ("ports", 1000)]
 //
-// We provide map-like semantics: [] operator for inserting/retrieving values,
-// keys are unique, and iteration is sorted.
+// Absent resource entries imply there is no (zero) such resources.
 //
-// Notes on handling negativity and arithmetic operations: during construction,
-// `Value::Scalar` arguments must be non-negative and finite. Invalid arguments
-// will result in an error where `Try` is returned. Once constructed, users can
-// use `[]` operator to mutate values directly. No member methods are provided
-// for arithmetic operations. Users should be mindful of producing negatives
-// when mutating the `Value::Scalar` directly.
-//
-// An alternative design for this class was to provide addition and
-// subtraction functions as opposed to a map interface. However, this
-// leads to some un-obvious semantics around presence of zero values
-// (will zero entries be automatically removed?) and handling of negatives
-// (will negatives trigger a crash? will they be converted to zero? Note
-// that Value::Scalar should be non-negative but there is currently no
-// enforcement of this by Value::Scalar arithmetic operations; we probably
-// want all Value::Scalar operations to go through the same negative
-// handling). To avoid the confusion, we provided a map like interface
-// which produces clear semantics: insertion works like maps, and the
-// user is responsible for performing arithmetic operations on the values
-// (using the already provided Value::Scalar arithmetic overloads).
+// Notes on handling negativity and arithmetic operations: values are guaranteed
+// to be positive. This is achieved by construction validation and no public
+// mutation interfaces. During construction, `Value::Scalar` arguments must be
+// non-negative and finite, and entries with zero quantities will be dropped
+// silently. Invalid arguments will result in an error where `Try`
+// is returned. For arithmetic operations, non-positive values are silently
+// dropped--this is consist with `class Resources`.
 //
 // Note for posterity, the status quo prior to this class
 // was to use stripped-down `Resources` objects for storing
@@ -71,6 +60,7 @@ class ResourceQuantities
 public:
   // Parse an input string of semicolon separated "name:number" pairs.
   // Duplicate names are allowed in the input and will be merged into one entry.
+  // Entries with zero values will be silently dropped.
   //
   // Example: "cpus:10;mem:1024;ports:3"
   //          "cpus:10; mem:1024; ports:3"
@@ -82,7 +72,31 @@ public:
   // will be returned.
   static Try<ResourceQuantities> fromString(const std::string& text);
 
+  // Take scalar `Resources` and combine them into `ResourceQuantities`.
+  // Only the resource name and its scalar value are used and the rest of the
+  // meta-data is ignored. It is caller's responsibility to ensure all
+  // `Resource` entries are of scalar type. Otherwise a `CHECK` error will
+  // be triggered.
+  static ResourceQuantities fromScalarResources(const Resources& resources);
+
+  // Returns the summed up `ResourceQuantities` given a
+  // `hashmap<Key, ResourceQuantities>`.
+  template <typename Key>
+  static ResourceQuantities sum(const hashmap<Key, ResourceQuantities>& map)
+  {
+    ResourceQuantities result;
+
+    foreachvalue (const ResourceQuantities& quantities, map) {
+      result += quantities;
+    }
+
+    return result;
+  }
+
   ResourceQuantities();
+
+  explicit ResourceQuantities(
+    const google::protobuf::Map<std::string, Value::Scalar>& map);
 
   ResourceQuantities(const ResourceQuantities& that) = default;
   ResourceQuantities(ResourceQuantities&& that) = default;
@@ -106,18 +120,120 @@ public:
 
   size_t size() const { return quantities.size(); };
 
-  // Returns the quantity scalar value if a quantity with the given name
-  // exists (even if the quantity is zero), otherwise return `None()`.
-  Option<Value::Scalar> get(const std::string& name) const;
+  bool empty() const { return quantities.empty(); }
 
-  // Like std::map, returns a reference to the quantity with the given name.
-  // If no quantity exists with the given name, a new entry will be created.
-  Value::Scalar& operator[](const std::string& name);
+  // Returns the quantity scalar value if a quantity with the given name.
+  // If the given name is absent, return zero.
+  Value::Scalar get(const std::string& name) const;
+
+  bool contains(const ResourceQuantities& quantities) const;
+
+  bool operator==(const ResourceQuantities& quantities) const;
+  bool operator!=(const ResourceQuantities& quantities) const;
+
+  ResourceQuantities& operator+=(const ResourceQuantities& quantities);
+  ResourceQuantities& operator-=(const ResourceQuantities& quantities);
+
+  ResourceQuantities operator+(const ResourceQuantities& quantities) const;
+  ResourceQuantities operator-(const ResourceQuantities& quantities) const;
 
 private:
+  void add(const std::string& name, const Value::Scalar& scalar);
+
   // List of name quantity pairs sorted by name.
   // Arithmetic and comparison operations benefit from this sorting.
   std::vector<std::pair<std::string, Value::Scalar>> quantities;
+};
+
+
+std::ostream& operator<<(std::ostream& stream, const ResourceQuantities& q);
+
+
+// An efficient collection of resource limits. All values are guaranteed
+// to be non-negative and finite.
+//
+// E.g. [("cpus", 4.5), ("gpus", 0.1), ("ports", 1000)]
+//
+// Difference with `class ResourceQuantities`:
+// The main difference resides in the semantics of absent entries and, in turn,
+// whether zero values are preserved.
+//
+//   (1) Absent entry in `ResourceQuantities` implies zero quantity. While in
+//   `ResourceLimits`, absence implies no limit (i.e. infinite amount). This
+//   affects the semantics of the contains operation.
+//
+//   (2) Zero value preservation: `ResourceLimits` keeps zero value entries
+//   while `ResourceQuantities` silently drops them. This is in accordance with
+//   the absence semantic. Zero value and absence are equivalent in
+//   `ResourceQuantities`. While in `ResourceLimits`, they are not.
+class ResourceLimits
+{
+public:
+  // Parse an input string of semicolon separated "name:number" pairs.
+  // Entries with zero values will be preserved (unlike `ResourceQuantities`).
+  // Duplicate names are NOT allowed in the input, otherwise an `Error` will
+  // be returned.
+  //
+  // Example: "cpus:10;mem:1024;ports:0"
+  //          "cpus:10; mem:1024; ports:0"
+  // NOTE: we will trim the whitespace around the pair and in the number.
+  // However, whitespace in "c p us:10" are preserved and will be parsed to
+  // {"c p us", 10}. This is consistent with `Resources::fromSimpleString()`.
+  //
+  // Numbers must be non-negative and finite, otherwise an `Error`
+  // will be returned.
+  static Try<ResourceLimits> fromString(const std::string& text);
+
+  ResourceLimits();
+
+  explicit ResourceLimits(
+    const google::protobuf::Map<std::string, Value::Scalar>& map);
+
+  ResourceLimits(const ResourceLimits& that) = default;
+  ResourceLimits(ResourceLimits&& that) = default;
+
+  ResourceLimits& operator=(const ResourceLimits& that) = default;
+  ResourceLimits& operator=(ResourceLimits&& that) = default;
+
+  typedef std::vector<std::pair<std::string, Value::Scalar>>::const_iterator
+    iterator;
+  typedef std::vector<std::pair<std::string, Value::Scalar>>::const_iterator
+    const_iterator;
+
+  // NOTE: Non-`const` `iterator`, `begin()` and `end()` are __intentionally__
+  // defined with `const` semantics in order to prevent mutation during
+  // iteration. Mutation is allowed with the `[]` operator.
+  const_iterator begin();
+  const_iterator end();
+
+  const_iterator begin() const { return limits.begin(); }
+  const_iterator end() const { return limits.end(); }
+
+  size_t size() const { return limits.size(); };
+
+  // Returns the limit of the resource with the given name.
+  // If there is no explicit limit for the resource, return `None()`.
+  // Note, `None()` implies that the limit of the resource is infinite.
+  Option<Value::Scalar> get(const std::string& name) const;
+
+  // Due to the absence-means-infinite semantic of limits, absent entries,
+  // intuitively, are considered to contain entries with finite scalar values.
+  // For example:
+  //    `[ ]`` will always contain any other `ResourceLimits`.
+  //    `[("cpu":1)]` contains `[("mem":1)]` and vice versa.
+  //    `[("cpu":1)]` will not contain `[("cpu":2)]`.
+  bool contains(const ResourceLimits& right) const;
+
+  bool contains(const ResourceQuantities& quantities) const;
+
+private:
+  // Set the limit of the resource with `name` to `scalar`.
+  // Note, the existing limit of the resource will be overwritten.
+  void set(const std::string& name, const Value::Scalar& scalar);
+
+  // List of name limit pairs sorted by name.
+  // Arithmetic and comparison operations benefit from this sorting.
+  std::vector<std::pair<std::string, Value::Scalar>> limits;
 };
 
 

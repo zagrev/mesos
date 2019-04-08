@@ -65,6 +65,16 @@ using mesos::master::detector::MasterDetector;
 using mesos::slave::ContainerTermination;
 using mesos::slave::Isolator;
 
+namespace process {
+
+void reinitialize(
+    const Option<string>& delegate,
+    const Option<string>& readonlyAuthenticationRealm,
+    const Option<string>& readwriteAuthenticationRealm);
+
+} // namespace process {
+
+
 namespace mesos {
 namespace internal {
 namespace tests {
@@ -1302,6 +1312,132 @@ TEST_F(LinuxFilesystemIsolatorMesosTest,
   AWAIT_READY(statusFailed);
   EXPECT_EQ(task.task_id(), statusFailed->task_id());
   EXPECT_EQ(TASK_FAILED, statusFailed->state());
+
+  driver.stop();
+  driver.join();
+}
+
+
+// This test verifies that a command task launched with a non-root user can
+// write to a shared persistent volume and a non-shared persistent volume.
+TEST_F(LinuxFilesystemIsolatorMesosTest,
+       ROOT_UNPRIVILEGED_USER_PersistentVolumes)
+{
+  // Reinitialize libprocess to ensure volume gid manager's metrics
+  // can be added in each iteration of this test (i.e., run this test
+  // repeatedly with the `--gtest_repeat` option).
+  process::reinitialize(None(), None(), None());
+
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  slave::Flags flags = CreateSlaveFlags();
+  flags.resources = "cpus:2;mem:128;disk(role1):128";
+  flags.isolation = "filesystem/linux,docker/runtime";
+  flags.volume_gid_range = "[10000-20000]";
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+
+  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get(), flags);
+  ASSERT_SOME(slave);
+
+  MockScheduler sched;
+  FrameworkInfo frameworkInfo = DEFAULT_FRAMEWORK_INFO;
+  frameworkInfo.set_roles(0, "role1");
+  frameworkInfo.add_capabilities()->set_type(
+      FrameworkInfo::Capability::SHARED_RESOURCES);
+
+  MesosSchedulerDriver driver(
+      &sched,
+      frameworkInfo,
+      master.get()->pid,
+      DEFAULT_CREDENTIAL);
+
+  EXPECT_CALL(sched, registered(&driver, _, _));
+
+  Future<vector<Offer>> offers;
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  driver.start();
+
+  AWAIT_READY(offers);
+  ASSERT_FALSE(offers->empty());
+
+  // Create two persistent volumes (shared and non-shared)
+  // which shall be used by the task to write to the volumes.
+  Resource volume1 = createPersistentVolume(
+      Megabytes(4),
+      "role1",
+      "id1",
+      "volume_path1",
+      None(),
+      None(),
+      frameworkInfo.principal(),
+      true); // Shared volume.
+
+  Resource volume2 = createPersistentVolume(
+      Megabytes(4),
+      "role1",
+      "id2",
+      "volume_path2",
+      None(),
+      None(),
+      frameworkInfo.principal(),
+      false); // Non-shared volume.
+
+  Option<string> user = os::getenv("SUDO_USER");
+  ASSERT_SOME(user);
+
+  CommandInfo command = createCommandInfo(
+        "echo hello > volume_path1/file && echo world > volume_path2/file");
+
+  command.set_user(user.get());
+
+  Resources taskResources =
+    Resources::parse("cpus:1;mem:64;disk(role1):1").get() + volume1 + volume2;
+
+  TaskInfo task = createTask(
+      offers.get()[0].slave_id(),
+      taskResources,
+      command);
+
+  Future<TaskStatus> statusStarting;
+  Future<TaskStatus> statusRunning;
+  Future<TaskStatus> statusFinished;
+
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&statusStarting))
+    .WillOnce(FutureArg<1>(&statusRunning))
+    .WillOnce(FutureArg<1>(&statusFinished));
+
+  driver.acceptOffers(
+      {offers.get()[0].id()},
+      {CREATE(volume1),
+       CREATE(volume2),
+       LAUNCH({task})});
+
+  AWAIT_READY(statusStarting);
+  EXPECT_EQ(task.task_id(), statusStarting->task_id());
+  EXPECT_EQ(TASK_STARTING, statusStarting->state());
+
+  AWAIT_READY(statusRunning);
+  EXPECT_EQ(task.task_id(), statusRunning->task_id());
+  EXPECT_EQ(TASK_RUNNING, statusRunning->state());
+
+  AWAIT_READY(statusFinished);
+  EXPECT_EQ(task.task_id(), statusFinished->task_id());
+  EXPECT_EQ(TASK_FINISHED, statusFinished->state());
+
+  // Two gids should have been allocated to the volumes. Please note that
+  // persistent volume's gid will be deallocated only when it is destroyed.
+  JSON::Object metrics = Metrics();
+  EXPECT_EQ(
+      metrics.at<JSON::Number>("volume_gid_manager/volume_gids_total")
+        ->as<int>() - 2,
+      metrics.at<JSON::Number>("volume_gid_manager/volume_gids_free")
+        ->as<int>());
 
   driver.stop();
   driver.join();

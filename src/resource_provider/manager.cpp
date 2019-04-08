@@ -173,7 +173,7 @@ struct ResourceProvider
 
   ResourceProviderInfo info;
   HttpConnection http;
-  hashmap<UUID, Owned<Promise<Nothing>>> publishes;
+  hashmap<id::UUID, Owned<Promise<Nothing>>> publishes;
 };
 
 
@@ -213,6 +213,12 @@ private:
   void updateOperationStatus(
       ResourceProvider* resourceProvider,
       const Call::UpdateOperationStatus& update);
+
+  ResourceProviderMessage createUpdateOperationStatus(
+      const OperationStatus& operationStatus,
+      const Option<id::UUID>& operationUuid,
+      const Option<FrameworkID>& frameworkId,
+      const Option<OperationStatus>& latestStatus);
 
   void updateState(
       ResourceProvider* resourceProvider,
@@ -459,7 +465,9 @@ void ResourceProviderManagerProcess::applyOperation(
     const ApplyOperationMessage& message)
 {
   const Offer::Operation& operation = message.operation_info();
-  const FrameworkID& frameworkId = message.framework_id();
+  const Option<FrameworkID> frameworkId = message.has_framework_id()
+    ? message.framework_id()
+    : Option<FrameworkID>::none();
   const UUID& operationUUID = message.operation_uuid();
 
   Result<ResourceProviderID> resourceProviderId =
@@ -468,7 +476,11 @@ void ResourceProviderManagerProcess::applyOperation(
   if (!resourceProviderId.isSome()) {
     LOG(ERROR) << "Failed to get the resource provider ID of operation "
                << "'" << operation.id() << "' (uuid: " << operationUUID
-               << ") from framework " << frameworkId << ": "
+               << ") from "
+               << (frameworkId.isSome()
+                     ? "framework " + stringify(frameworkId.get())
+                     : "an operator API call")
+               << ": "
                << (resourceProviderId.isError() ? resourceProviderId.error()
                                                 : "Not found");
     return;
@@ -476,7 +488,10 @@ void ResourceProviderManagerProcess::applyOperation(
 
   if (!resourceProviders.subscribed.contains(resourceProviderId.get())) {
     LOG(WARNING) << "Dropping operation '" << operation.id() << "' (uuid: "
-                 << operationUUID << ") from framework " << frameworkId
+                 << operationUUID << ") from "
+                 << (frameworkId.isSome()
+                       ? "framework " + stringify(frameworkId.get())
+                       : "an operator API call")
                  << " because resource provider " << resourceProviderId.get()
                  << " is not subscribed";
     return;
@@ -496,8 +511,10 @@ void ResourceProviderManagerProcess::applyOperation(
 
   Event event;
   event.set_type(Event::APPLY_OPERATION);
-  event.mutable_apply_operation()
-    ->mutable_framework_id()->CopyFrom(frameworkId);
+  if (frameworkId.isSome()) {
+    event.mutable_apply_operation()
+      ->mutable_framework_id()->CopyFrom(frameworkId.get());
+  }
   event.mutable_apply_operation()->mutable_info()->CopyFrom(operation);
   event.mutable_apply_operation()
     ->mutable_operation_uuid()->CopyFrom(message.operation_uuid());
@@ -507,9 +524,12 @@ void ResourceProviderManagerProcess::applyOperation(
 
   if (!resourceProvider->http.send(event)) {
     LOG(WARNING) << "Failed to send operation '" << operation.id() << "' "
-                 << "(uuid: " << operationUUID << ") from framework "
-                 << frameworkId << " to resource provider "
-                 << resourceProviderId.get() << ": connection closed";
+                 << "(uuid: " << operationUUID << ") from "
+                 << (frameworkId.isSome()
+                       ? "framework " + stringify(frameworkId.get())
+                       : "an operator API call")
+                 << " to resource provider " << resourceProviderId.get()
+                 << ": connection closed";
   }
 }
 
@@ -573,19 +593,64 @@ void ResourceProviderManagerProcess::reconcileOperations(
       }
   };
 
-  // Construct events for individual resource providers.
+  // If the framework ID is set, then this reconciliation request originated
+  // from the framework; otherwise, it originated from the master. If it's from
+  // the framework, then we return an operation state based on whether or not
+  // the resource provider is known. If it's from the master, then we forward it
+  // to the resource provider to determine whether or not this operation was
+  // dropped en route to the agent.
+  Option<FrameworkID> frameworkId = message.has_framework_id()
+    ? message.framework_id()
+    : Option<FrameworkID>::none();
+
+  // Construct events for individual resource providers, or send appropriate
+  // operation status updates if resource providers are not subscribed.
   foreach (
       const ReconcileOperationsMessage::Operation& operation,
       message.operations()) {
     if (operation.has_resource_provider_id()) {
       if (!resourceProviders.subscribed.contains(
               operation.resource_provider_id())) {
-        // TODO(bbannier): We should send `OPERATION_UNREACHABLE` here.
-        LOG(WARNING) << "Dropping operation reconciliation message with"
-                     << " operation_uuid " << operation.operation_uuid()
-                     << " because resource provider "
-                     << operation.resource_provider_id()
-                     << " is not subscribed";
+        OperationState state;
+        if (resourceProviders.known.contains(
+                operation.resource_provider_id())) {
+          // The resource provider is not currently subscribed, but since it is
+          // known, we expect it to resubscribe. We send OPERATION_RECOVERING in
+          // this case.
+          state = OPERATION_RECOVERING;
+        } else {
+          // The resource provider is not known; we return OPERATION_UNKNOWN in
+          // this case.
+          state = OPERATION_UNKNOWN;
+        }
+
+        Option<id::UUID> uuid;
+        if (operation.has_operation_uuid()) {
+          Try<id::UUID> uuid_ =
+            id::UUID::fromBytes(operation.operation_uuid().value());
+          CHECK_SOME(uuid_);
+          uuid = uuid_.get();
+        }
+
+        // NOTE: the `SlaveID` is left blank in the operation status below
+        // because the RP manager does not have access to this information. The
+        // agent will inject the ID before forwarding to the master.
+        messages.put(
+            createUpdateOperationStatus(
+                protobuf::createOperationStatus(
+                    state,
+                    operation.has_operation_id()
+                      ? operation.operation_id()
+                      : Option<OperationID>::none(),
+                    None(),
+                    None(),
+                    uuid,
+                    None(),
+                    operation.resource_provider_id()),
+                uuid,
+                frameworkId,
+                None()));
+
         continue;
       }
 
@@ -702,12 +767,13 @@ Future<Nothing> ResourceProviderManagerProcess::publishResources(
   foreachpair (const ResourceProviderID& resourceProviderId,
                const Resources& resources,
                providedResources) {
-    UUID uuid = protobuf::createUUID();
+    id::UUID uuid = id::UUID::random();
 
     Event event;
     event.set_type(Event::PUBLISH_RESOURCES);
-    event.mutable_publish_resources()->mutable_uuid()->CopyFrom(uuid);
-    event.mutable_publish_resources()->mutable_resources()->CopyFrom(resources);
+    *event.mutable_publish_resources()->mutable_uuid() =
+      protobuf::createUUID(uuid);
+    *event.mutable_publish_resources()->mutable_resources() = resources;
 
     ResourceProvider* resourceProvider =
       resourceProviders.subscribed.at(resourceProviderId).get();
@@ -898,27 +964,60 @@ void ResourceProviderManagerProcess::updateOperationStatus(
 {
   CHECK_EQ(update.status().resource_provider_id(), resourceProvider->info.id());
 
-  ResourceProviderMessage::UpdateOperationStatus body;
-  body.update.mutable_status()->CopyFrom(update.status());
-  body.update.mutable_operation_uuid()->CopyFrom(update.operation_uuid());
-
+  Option<FrameworkID> frameworkId;
   if (update.has_framework_id()) {
-    body.update.mutable_framework_id()->CopyFrom(update.framework_id());
+    frameworkId = update.framework_id();
   }
 
+  Option<OperationStatus> latestStatus;
   if (update.has_latest_status()) {
     CHECK_EQ(
         update.latest_status().resource_provider_id(),
         resourceProvider->info.id());
 
-    body.update.mutable_latest_status()->CopyFrom(update.latest_status());
+    latestStatus = update.latest_status();
+  }
+
+  Try<id::UUID> uuid = id::UUID::fromBytes(update.operation_uuid().value());
+  CHECK_SOME(uuid);
+
+  messages.put(
+      createUpdateOperationStatus(
+          update.status(),
+          uuid.get(),
+          frameworkId,
+          latestStatus));
+}
+
+
+ResourceProviderMessage
+ResourceProviderManagerProcess::createUpdateOperationStatus(
+    const OperationStatus& operationStatus,
+    const Option<id::UUID>& operationUuid,
+    const Option<FrameworkID>& frameworkId,
+    const Option<OperationStatus>& latestStatus)
+{
+  ResourceProviderMessage::UpdateOperationStatus body;
+  body.update.mutable_status()->CopyFrom(operationStatus);
+
+  if (operationUuid.isSome()) {
+    body.update.mutable_operation_uuid()->CopyFrom(
+        protobuf::createUUID(operationUuid.get()));
+  }
+
+  if (frameworkId.isSome()) {
+    body.update.mutable_framework_id()->CopyFrom(frameworkId.get());
+  }
+
+  if (latestStatus.isSome()) {
+    body.update.mutable_latest_status()->CopyFrom(latestStatus.get());
   }
 
   ResourceProviderMessage message;
   message.type = ResourceProviderMessage::Type::UPDATE_OPERATION_STATUS;
   message.updateOperationStatus = std::move(body);
 
-  messages.put(std::move(message));
+  return message;
 }
 
 
@@ -960,32 +1059,39 @@ void ResourceProviderManagerProcess::updatePublishResourcesStatus(
     ResourceProvider* resourceProvider,
     const Call::UpdatePublishResourcesStatus& update)
 {
-  const UUID& uuid = update.uuid();
+  Try<id::UUID> uuid = id::UUID::fromBytes(update.uuid().value());
 
-  if (!resourceProvider->publishes.contains(uuid)) {
-    LOG(ERROR) << "Ignoring UpdatePublishResourcesStatus from resource"
-               << " provider " << resourceProvider->info.id()
-               << " because UUID " << uuid << " is unknown";
+  if (uuid.isError()) {
+    LOG(ERROR)
+      << "Ignoring UpdatePublishResourcesStatus from resource provider "
+      << resourceProvider->info.id() << ": " << uuid.error();
+
+    return;
+  }
+
+  if (!resourceProvider->publishes.contains(uuid.get())) {
+    LOG(ERROR)
+      << "Ignoring UpdatePublishResourcesStatus from resource provider "
+      << resourceProvider->info.id() << ": Unknown UUID " << uuid.get();
+
     return;
   }
 
   LOG(INFO)
     << "Received UPDATE_PUBLISH_RESOURCES_STATUS call for PUBLISH_RESOURCES"
-    << " event " << uuid << " with " << update.status()
+    << " event " << uuid.get() << " with " << update.status()
     << " status from resource provider " << resourceProvider->info.id();
 
   if (update.status() == Call::UpdatePublishResourcesStatus::OK) {
-    resourceProvider->publishes.at(uuid)->set(Nothing());
+    resourceProvider->publishes.at(uuid.get())->set(Nothing());
   } else {
     // TODO(jieyu): Consider to include an error message in
     // 'UpdatePublishResourcesStatus' and surface that to the caller.
-    resourceProvider->publishes.at(uuid)->fail(
-        "Failed to publish resources for resource provider " +
-        stringify(resourceProvider->info.id()) + ": Received " +
-        stringify(update.status()) + " status");
+    resourceProvider->publishes.at(uuid.get())->fail(
+        "Received " + stringify(update.status()) + " status");
   }
 
-  resourceProvider->publishes.erase(uuid);
+  resourceProvider->publishes.erase(uuid.get());
 }
 
 

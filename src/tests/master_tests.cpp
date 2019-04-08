@@ -2945,6 +2945,31 @@ TEST_F(MasterTest, RegistryUpdateAfterMasterFailover)
 }
 
 
+TEST_F(MasterTest, RecoverWithMinimumCapability)
+{
+  Try<Owned<cluster::Master>> master = StartMaster(CreateMasterFlags());
+  ASSERT_SOME(master);
+
+  Registry registry;
+
+  registry.add_minimum_capabilities()->set_capability(
+      MasterInfo::Capability::Type_Name(MasterInfo::Capability::AGENT_UPDATE));
+
+  EXPECT_TRUE(
+      Master::misingMinimumCapabilities(master.get()->getMasterInfo(), registry)
+        .empty());
+
+  registry.add_minimum_capabilities()->set_capability("SUPER_POWER");
+
+  hashset<string> result =
+    Master::misingMinimumCapabilities(master->get()->getMasterInfo(), registry);
+
+  hashset<string> expected = {"SUPER_POWER"};
+
+  EXPECT_EQ(expected, result);
+}
+
+
 // This test ensures that when a slave is recovered from the registry
 // but does not reregister with the master, it is marked unreachable
 // in the registry, the framework is informed that the slave is lost,
@@ -9222,6 +9247,9 @@ TEST_F(MasterTest, OperationUpdateDuringFailover)
 
   AWAIT_READY(updateOperationStatusMessage1);
   AWAIT_READY(updateOperationStatusMessage2);
+  EXPECT_TRUE(metricEquals("master/operations/pending", 2));
+  EXPECT_TRUE(metricEquals("master/operations/reserve/pending", 1));
+  EXPECT_TRUE(metricEquals("master/operations/create_disk/pending", 1));
 
   // Fail over the master.
   master->reset();
@@ -9289,8 +9317,509 @@ TEST_F(MasterTest, OperationUpdateDuringFailover)
     EXPECT_EQ(receivedOperationUUIDs, expectedOperationUUIDs);
   }
 
+  EXPECT_TRUE(metricEquals("master/operations/pending", 0));
+  EXPECT_TRUE(metricEquals("master/operations/reserve/pending", 0));
+  EXPECT_TRUE(metricEquals("master/operations/create_disk/pending", 0));
+
+  EXPECT_TRUE(metricEquals("master/operations/finished", 2));
+  EXPECT_TRUE(metricEquals("master/operations/reserve/finished", 1));
+  EXPECT_TRUE(metricEquals("master/operations/create_disk/finished", 1));
+
   driver.stop();
   driver.join();
+}
+
+
+// Tests that the master acknowledges reliably-sent operation status updates
+// when the framework that requested feedback has been torn down.
+TEST_F(MasterTest, OperationUpdateCompletedFramework)
+{
+  Clock::pause();
+
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  slave::Flags slaveFlags = CreateSlaveFlags();
+
+  Future<UpdateSlaveMessage> updateSlaveMessage =
+    FUTURE_PROTOBUF(UpdateSlaveMessage(), _, _);
+
+  StandaloneMasterDetector detector(master.get()->pid);
+  Try<Owned<cluster::Slave>> slave = StartSlave(&detector, slaveFlags);
+  ASSERT_SOME(slave);
+
+  Clock::advance(slaveFlags.registration_backoff_factor);
+
+  AWAIT_READY(updateSlaveMessage);
+
+  // Register a resource provider with the agent.
+  mesos::v1::ResourceProviderInfo resourceProviderInfo;
+  resourceProviderInfo.set_type("org.apache.mesos.resource_provider.test");
+  resourceProviderInfo.set_name("test");
+
+  v1::Resources resourceProviderResources = v1::createDiskResource(
+      "200", "*", None(), None(), v1::createDiskSourceRaw(None(), "profile"));
+
+  v1::MockResourceProvider resourceProvider(
+      resourceProviderInfo,
+      resourceProviderResources);
+
+  Owned<EndpointDetector> endpointDetector(
+      resource_provider::createEndpointDetector(slave.get()->pid));
+
+  updateSlaveMessage = FUTURE_PROTOBUF(UpdateSlaveMessage(), _, _);
+
+  resourceProvider.start(endpointDetector, ContentType::PROTOBUF);
+
+  AWAIT_READY(updateSlaveMessage);
+
+  ASSERT_TRUE(resourceProvider.info.has_id());
+
+  // Start a framework to operate on offers.
+  auto scheduler = std::make_shared<v1::MockHTTPScheduler>();
+
+  v1::FrameworkInfo frameworkInfo = v1::DEFAULT_FRAMEWORK_INFO;
+  frameworkInfo.set_roles(0, DEFAULT_TEST_ROLE);
+
+  EXPECT_CALL(*scheduler, connected(_))
+    .WillOnce(v1::scheduler::SendSubscribe(frameworkInfo));
+
+  Future<v1::scheduler::Event::Subscribed> subscribed;
+  EXPECT_CALL(*scheduler, subscribed(_, _))
+    .WillOnce(FutureArg<1>(&subscribed));
+
+  // Ignore heartbeats.
+  EXPECT_CALL(*scheduler, heartbeat(_))
+    .WillRepeatedly(Return());
+
+  Future<v1::scheduler::Event::Offers> offers;
+
+  // Decline offers that do not contain wanted resources.
+  EXPECT_CALL(*scheduler, offers(_, _))
+    .WillRepeatedly(v1::scheduler::DeclineOffers());
+
+  EXPECT_CALL(*scheduler, offers( _, v1::scheduler::OffersHaveAnyResource(
+      [](const v1::Resource& r) { return r.has_provider_id(); })))
+    .WillOnce(FutureArg<1>(&offers));
+
+  auto mesos = std::make_shared<v1::scheduler::TestMesos>(
+      master.get()->pid, ContentType::PROTOBUF, scheduler);
+
+  AWAIT_READY(subscribed);
+  v1::FrameworkID frameworkId(subscribed->framework_id());
+
+  AWAIT_READY(offers);
+  ASSERT_FALSE(offers->offers().empty());
+
+  const v1::Offer& offer = offers->offers(0);
+
+  EXPECT_CALL(*scheduler, updateOperationStatus(_, _))
+    .WillRepeatedly(Return()); // Do not acknowledge status updates.
+
+  // Perform an operation on resource provider resources.
+  //
+  // NOTE: We use a speculated operation here to avoid running into MESOS-9542.
+  //
+  // TODO(bbannier): Once operations on agent-default resources are backed with
+  // an operation status update manager we could work with just agent resources
+  // in this test.
+  Option<v1::Resource> disk = None();
+  foreach(const v1::Resource& resource, offer.resources()) {
+    if (resource.has_provider_id()) {
+      disk = resource;
+      break;
+    }
+  }
+
+  ASSERT_SOME(disk);
+
+  v1::Resource reserved = disk.get();
+  reserved.add_reservations()->CopyFrom(
+      v1::createDynamicReservationInfo(
+          frameworkInfo.roles(0), DEFAULT_CREDENTIAL.principal()));
+
+  // Set an operation ID so the framework would get feedback it would
+  // need to acknowledge.
+  v1::OperationID operationId;
+  operationId.set_value("operation");
+
+  Future<mesos::v1::resource_provider::Event::ApplyOperation> applyOperation;
+  EXPECT_CALL(resourceProvider, applyOperation(_))
+    .WillOnce(FutureArg<0>(&applyOperation));
+
+  mesos->send(v1::createCallAccept(
+      frameworkId, offer, {v1::RESERVE(reserved, operationId)}));
+
+  // Let the operation hang in the resource provider.
+  AWAIT_READY(applyOperation);
+
+  Future<ShutdownFrameworkMessage> shutdownFrameworkMessage =
+    FUTURE_PROTOBUF(ShutdownFrameworkMessage(), _, _);
+
+  // Disconnect the scheduler. Since the default framework failover
+  // timeout is 0 this will cause the framework to be removed.
+  mesos.reset();
+
+  AWAIT_READY(shutdownFrameworkMessage);
+
+  Future<AcknowledgeOperationStatusMessage> acknowledgeOperationStatusMessage =
+    FUTURE_PROTOBUF(AcknowledgeOperationStatusMessage(), _, slave.get()->pid);
+
+  Future<Nothing> acknowledgeOperationStatus;
+  EXPECT_CALL(resourceProvider, acknowledgeOperationStatus(_))
+    .WillOnce(FutureSatisfy(&acknowledgeOperationStatus));
+
+  resourceProvider.operationDefault(applyOperation.get());
+
+  // We expect the master to acknowledge the operation status update.
+  AWAIT_READY(acknowledgeOperationStatusMessage);
+  AWAIT_READY(acknowledgeOperationStatus);
+}
+
+
+// When an agent is downgraded from RESOURCE_PROVIDER-capable to one that does
+// not have this capability, the agent should still recover any operations on
+// agent default resources which requested feedback when it had the
+// RESOURCE_PROVIDER capability, and the framework should be able to
+// acknowledge them.
+TEST_F(MasterTest, AckOperationsAfterAgentCapabilityChange)
+{
+  Clock::pause();
+
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+
+  slave::Flags slaveFlags = CreateSlaveFlags();
+
+  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get(), slaveFlags);
+  ASSERT_SOME(slave);
+
+  // Advance the clock to trigger agent registration.
+  Clock::advance(slaveFlags.registration_backoff_factor);
+
+  // Register a framework to exercise an operation.
+  v1::FrameworkInfo frameworkInfo = v1::DEFAULT_FRAMEWORK_INFO;
+  frameworkInfo.set_roles(0, DEFAULT_TEST_ROLE);
+
+  auto scheduler = std::make_shared<v1::MockHTTPScheduler>();
+
+  EXPECT_CALL(*scheduler, connected(_))
+    .WillOnce(v1::scheduler::SendSubscribe(frameworkInfo));
+
+  Future<Event::Subscribed> subscribed;
+  EXPECT_CALL(*scheduler, subscribed(_, _))
+    .WillOnce(FutureArg<1>(&subscribed));
+
+  EXPECT_CALL(*scheduler, heartbeat(_))
+    .WillRepeatedly(Return()); // Ignore heartbeats.
+
+  Future<Event::Offers> offers;
+
+  // Set an expectation for the first offer.
+  EXPECT_CALL(*scheduler, offers(_, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  v1::scheduler::TestMesos mesos(
+      master.get()->pid,
+      ContentType::PROTOBUF,
+      scheduler);
+
+  AWAIT_READY(subscribed);
+
+  const v1::FrameworkID& frameworkId = subscribed->framework_id();
+
+  AWAIT_READY(offers);
+  ASSERT_FALSE(offers->offers().empty());
+
+  const v1::Offer& offer = offers->offers(0);
+
+  // Reserve resources.
+  v1::OperationID operationId;
+  operationId.set_value("operation");
+
+  ASSERT_FALSE(offer.resources().empty());
+
+  v1::Resource reservedResources(*(offer.resources().begin()));
+  reservedResources.add_reservations()->CopyFrom(
+      v1::createDynamicReservationInfo(
+          frameworkInfo.roles(0), DEFAULT_CREDENTIAL.principal()));
+
+  Future<Event::UpdateOperationStatus> update;
+  EXPECT_CALL(*scheduler, updateOperationStatus(_, _))
+    .WillOnce(FutureArg<1>(&update));
+
+  mesos.send(v1::createCallAccept(
+      frameworkId,
+      offer,
+      {v1::RESERVE(reservedResources, operationId)}));
+
+  AWAIT_READY(update);
+
+  EXPECT_EQ(operationId, update->status().operation_id());
+  EXPECT_EQ(v1::OPERATION_FINISHED, update->status().state());
+
+  // Restart the agent.
+  slave.get()->terminate();
+
+  // Since the operation status update manager will automatically resend
+  // updates upon agent startup, we add an additional expectation to ignore
+  // subsequent updates which may be sent when advancing the clock for agent
+  // registration.
+  Future<Event::UpdateOperationStatus> retriedUpdate;
+  EXPECT_CALL(*scheduler, updateOperationStatus(_, _))
+    .WillOnce(FutureArg<1>(&retriedUpdate))
+    .WillRepeatedly(Return());
+
+  slaveFlags.agent_features = SlaveCapabilities();
+
+  foreach (
+      const SlaveInfo::Capability& slaveCapability,
+      slave::AGENT_CAPABILITIES()) {
+    if (slaveCapability.type() !=
+        SlaveInfo::Capability::RESOURCE_PROVIDER) {
+      slaveFlags.agent_features->add_capabilities()->CopyFrom(slaveCapability);
+    }
+  }
+
+  slave = StartSlave(detector.get(), slaveFlags);
+  ASSERT_SOME(slave);
+
+  // Advance the clock to trigger agent registration.
+  Clock::advance(slaveFlags.registration_backoff_factor);
+
+  AWAIT_READY(retriedUpdate);
+
+  // Verify that the operation appears in the master's state
+  // after agent reregistration.
+  {
+    v1::master::Call call;
+    call.set_type(v1::master::Call::GET_OPERATIONS);
+
+    process::http::Headers headers = createBasicAuthHeaders(DEFAULT_CREDENTIAL);
+    headers["Accept"] = stringify(ContentType::PROTOBUF);
+
+    Future<Response> response = process::http::post(
+        master.get()->pid,
+        "api/v1",
+        headers,
+        serialize(ContentType::PROTOBUF, call),
+        stringify(ContentType::PROTOBUF));
+
+    AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response);
+
+    Try<v1::master::Response> response_ =
+      deserialize<v1::master::Response>(ContentType::PROTOBUF, response->body);
+
+    ASSERT_SOME(response_);
+    const v1::master::Response::GetOperations& operations =
+      response_->get_operations();
+
+    ASSERT_EQ(1, operations.operations_size());
+    EXPECT_EQ(
+        mesos::v1::OperationState::OPERATION_FINISHED,
+        operations.operations(0).latest_status().state());
+    EXPECT_EQ(operationId, operations.operations(0).info().id());
+  }
+
+  Future<AcknowledgeOperationStatusMessage> acknowledgeOperationStatusMessage =
+    FUTURE_PROTOBUF(
+        AcknowledgeOperationStatusMessage(),
+        master.get()->pid,
+        slave.get()->pid);
+
+  mesos.send(v1::createCallAcknowledgeOperationStatus(
+      frameworkId, offer.agent_id(), None(), retriedUpdate.get()));
+
+  AWAIT_READY(acknowledgeOperationStatusMessage);
+
+  // The operation status update has been acknowledged, so the agent shouldn't
+  // send further status updates.
+  EXPECT_NO_FUTURE_PROTOBUFS(UpdateOperationStatusMessage(), _, _);
+
+  Clock::advance(slave::STATUS_UPDATE_RETRY_INTERVAL_MAX);
+  Clock::settle();
+  Clock::resume();
+}
+
+
+// When an agent is downgraded from an AGENT_OPERATION_FEEDBACK-capable agent
+// to one that does not have this capability, the master should clean up any
+// terminal-but-unacked operations on that agent's default resources from the
+// the master's in-memory state.
+TEST_F(MasterTest, CleanupOperationsAfterAgentDowngrade)
+{
+  Clock::pause();
+
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+
+  slave::Flags slaveFlags = CreateSlaveFlags();
+
+  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get(), slaveFlags);
+  ASSERT_SOME(slave);
+
+  // Advance the clock to trigger agent registration.
+  Clock::advance(slaveFlags.registration_backoff_factor);
+
+  // Register a framework to exercise an operation.
+  v1::FrameworkInfo frameworkInfo = v1::DEFAULT_FRAMEWORK_INFO;
+  frameworkInfo.set_roles(0, DEFAULT_TEST_ROLE);
+
+  auto scheduler = std::make_shared<v1::MockHTTPScheduler>();
+
+  EXPECT_CALL(*scheduler, connected(_))
+    .WillOnce(v1::scheduler::SendSubscribe(frameworkInfo));
+
+  Future<Event::Subscribed> subscribed;
+  EXPECT_CALL(*scheduler, subscribed(_, _))
+    .WillOnce(FutureArg<1>(&subscribed));
+
+  EXPECT_CALL(*scheduler, heartbeat(_))
+    .WillRepeatedly(Return()); // Ignore heartbeats.
+
+  Future<Event::Offers> offers;
+
+  // Set an expectation for the first offer.
+  EXPECT_CALL(*scheduler, offers(_, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  v1::scheduler::TestMesos mesos(
+      master.get()->pid,
+      ContentType::PROTOBUF,
+      scheduler);
+
+  AWAIT_READY(subscribed);
+
+  const v1::FrameworkID& frameworkId = subscribed->framework_id();
+
+  AWAIT_READY(offers);
+  ASSERT_FALSE(offers->offers().empty());
+
+  const v1::Offer& offer = offers->offers(0);
+
+  // Reserve resources.
+  v1::OperationID operationId;
+  operationId.set_value("operation");
+
+  ASSERT_FALSE(offer.resources().empty());
+
+  v1::Resource reservedResources(*(offer.resources().begin()));
+  reservedResources.add_reservations()->CopyFrom(
+      v1::createDynamicReservationInfo(
+          frameworkInfo.roles(0), DEFAULT_CREDENTIAL.principal()));
+
+  Future<Event::UpdateOperationStatus> update;
+  EXPECT_CALL(*scheduler, updateOperationStatus(_, _))
+    .WillOnce(FutureArg<1>(&update));
+
+  mesos.send(v1::createCallAccept(
+      frameworkId,
+      offer,
+      {v1::RESERVE(reservedResources, operationId)}));
+
+  AWAIT_READY(update);
+
+  EXPECT_EQ(operationId, update->status().operation_id());
+  EXPECT_EQ(v1::OPERATION_FINISHED, update->status().state());
+
+  // Verify the presence of the unacked operation
+  // before the agent is downgraded.
+  {
+    v1::master::Call call;
+    call.set_type(v1::master::Call::GET_OPERATIONS);
+
+    process::http::Headers headers = createBasicAuthHeaders(DEFAULT_CREDENTIAL);
+    headers["Accept"] = stringify(ContentType::PROTOBUF);
+
+    Future<Response> response = process::http::post(
+        master.get()->pid,
+        "api/v1",
+        headers,
+        serialize(ContentType::PROTOBUF, call),
+        stringify(ContentType::PROTOBUF));
+
+    AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response);
+
+    Try<v1::master::Response> response_ =
+      deserialize<v1::master::Response>(ContentType::PROTOBUF, response->body);
+
+    ASSERT_SOME(response_);
+    const v1::master::Response::GetOperations& operations =
+      response_->get_operations();
+
+    ASSERT_EQ(1, operations.operations_size());
+    EXPECT_EQ(
+        mesos::v1::OperationState::OPERATION_FINISHED,
+        operations.operations(0).latest_status().state());
+    EXPECT_EQ(operationId, operations.operations(0).info().id());
+  }
+
+  // Restart the agent.
+  slave.get()->terminate();
+
+  // Although we remove the AGENT_OPERATION_FEEDBACK capability below, the agent
+  // is still using newer code. Thus, it will resend operation updates and
+  // include unacked operations in its UpdateSlaveMessage. We drop these
+  // messages to approximate an old agent.
+  DROP_PROTOBUFS(UpdateOperationStatusMessage(), _, _);
+  DROP_PROTOBUFS(UpdateSlaveMessage(), _, _);
+
+  Future<SlaveReregisteredMessage> slaveReregisteredMessage =
+    FUTURE_PROTOBUF(SlaveReregisteredMessage(), _, _);
+
+  slaveFlags.agent_features = SlaveCapabilities();
+
+  foreach (
+      const SlaveInfo::Capability& slaveCapability,
+      slave::AGENT_CAPABILITIES()) {
+    if (slaveCapability.type() !=
+        SlaveInfo::Capability::AGENT_OPERATION_FEEDBACK) {
+      slaveFlags.agent_features->add_capabilities()->CopyFrom(slaveCapability);
+    }
+  }
+
+  slave = StartSlave(detector.get(), slaveFlags);
+  ASSERT_SOME(slave);
+
+  // Advance the clock to trigger agent registration.
+  Clock::advance(slaveFlags.registration_backoff_factor);
+
+  AWAIT_READY(slaveReregisteredMessage);
+
+  // Verify that the operation is gone after the agent is downgraded.
+  {
+    v1::master::Call call;
+    call.set_type(v1::master::Call::GET_OPERATIONS);
+
+    process::http::Headers headers = createBasicAuthHeaders(DEFAULT_CREDENTIAL);
+    headers["Accept"] = stringify(ContentType::PROTOBUF);
+
+    Future<Response> response = process::http::post(
+        master.get()->pid,
+        "api/v1",
+        headers,
+        serialize(ContentType::PROTOBUF, call),
+        stringify(ContentType::PROTOBUF));
+
+    AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response);
+
+    Try<v1::master::Response> response_ =
+      deserialize<v1::master::Response>(ContentType::PROTOBUF, response->body);
+
+    ASSERT_SOME(response_);
+    const v1::master::Response::GetOperations& operations =
+      response_->get_operations();
+
+    ASSERT_EQ(0, operations.operations_size());
+  }
+
+  Clock::resume();
 }
 
 

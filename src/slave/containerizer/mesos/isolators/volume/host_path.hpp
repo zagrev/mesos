@@ -21,6 +21,8 @@
 
 #include "slave/containerizer/mesos/isolator.hpp"
 
+#include "slave/containerizer/mesos/isolators/volume/utils.hpp"
+
 namespace mesos {
 namespace internal {
 namespace slave {
@@ -41,8 +43,12 @@ public:
 
 private:
   VolumeHostPathIsolatorProcess(const Flags& flags);
+  VolumeHostPathIsolatorProcess(
+      const Flags& flags,
+      const volume::PathValidator& pathValidator);
 
   const Flags flags;
+  const Option<volume::PathValidator> pathValidator;
 };
 
 } // namespace slave {

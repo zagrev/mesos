@@ -15,7 +15,7 @@ mechanism for filtering of certain system calls. Seccomp requires Linux kernel
 
 Seccomp filter is defined by a Seccomp profile which must be compatible with
 the Docker Seccomp profile format. An example of the Seccomp profile can be
-found in [default.json](../examples/seccomp_default.json).
+found in [default.json](../../examples/seccomp_default.json).
 
 **Note**: Mesos containerizer uses `pivot_root` system call, so it **must be**
 specified in the Seccomp profile. Usually, the Docker Seccomp profile contains
@@ -53,4 +53,6 @@ sudo mesos-agent --master=<master ip> --ip=<agent ip>
 
 In order for a Mesos task to override the agent's default Seccomp profile,
 it should declare the required profile in the `LinuxInfo` field of its
-`ContainerInfo`.
+`ContainerInfo`. E.g., if the agent is launched with the default Seccomp
+profile enabled, a framework can disable Seccomp for a particular task by
+setting an `unconfined` field in the corresponding `SeccompInfo`.

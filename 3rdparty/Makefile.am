@@ -50,7 +50,8 @@ include versions.am
 
 BOOST = boost-$(BOOST_VERSION)
 CONCURRENTQUEUE = concurrentqueue-$(CONCURRENTQUEUE_VERSION)
-CSI = csi-$(CSI_VERSION)
+CSI_V0 = csi-$(CSI_V0_VERSION)
+CSI_V1 = csi-$(CSI_V1_VERSION)
 ELFIO = elfio-$(ELFIO_VERSION)
 GLOG = glog-$(GLOG_VERSION)
 GMOCK = $(GOOGLETEST)/googlemock
@@ -77,7 +78,8 @@ ZOOKEEPER = zookeeper-$(ZOOKEEPER_VERSION)
 EXTRA_DIST =			\
   $(BOOST).tar.gz		\
   $(CONCURRENTQUEUE).tar.gz	\
-  $(CSI).tar.gz			\
+  $(CSI_V0).tar.gz		\
+  $(CSI_V1).tar.gz		\
   $(ELFIO).tar.gz		\
   $(GLOG).tar.gz		\
   $(GOOGLETEST).tar.gz		\
@@ -139,7 +141,8 @@ EXTRA_DIST +=			\
 CLEAN_EXTRACTED =		\
   $(BOOST)			\
   $(CONCURRENTQUEUE)		\
-  $(CSI)			\
+  $(CSI_V0)			\
+  $(CSI_V1)			\
   $(ELFIO)			\
   $(GLOG)			\
   $(GOOGLETEST)			\
@@ -167,6 +170,20 @@ CLEAN_EXTRACTED =		\
 %-stamp: %.tar.gz
 	gzip -d -c $^ | tar xf -
 	test ! -e $(srcdir)/$*.patch || patch -d $* -p1 <$(srcdir)/$*.patch
+	touch $@
+
+# NOTE: The upstream CSI release tarball is packed with top-level directory
+# `spec-<X.Y.Z>`. To avoid conflicts and be consistent with where other packages
+# are extracted, we extract the tarball in directory `csi-<X.Y.Z>`.
+#
+# NOTE: Since GNU make 3.81 does not support shortest-stem pattern matching, we
+# explicitly specify a static pattern rule here.
+CSI_STAMPS = $(CSI_V0)-stamp $(CSI_V1)-stamp
+$(CSI_STAMPS): csi-%-stamp: csi-%.tar.gz
+	$(MKDIR_P) csi-$*
+	gzip -d -c $^ | (cd csi-$* && tar xf -)
+	test ! -e $(srcdir)/csi-$*.patch || \
+	  patch -d csi-$*/spec-$* -p1 <$(srcdir)/csi-$*.patch
 	touch $@
 
 # Dependencies for all-local.
@@ -526,9 +543,30 @@ $(GRPC)-build-stamp:
 	touch $@
 endif
 
-# NOTE: We extract `csi.proto` even if gRPC is disabled because it is
-# imported by other proto files.
-ALL_LOCAL += $(CSI)-stamp
+# NOTE: To support multiple CSI versions, we move the CSI proto files to
+# version-qualified paths so `protoc` can find them.
+$(CSI_V0)-build-stamp: $(CSI_V0)-stamp
+	$(MKDIR_P) $(CSI_V0)/csi/v0
+	mv $(CSI_V0)/spec-$(CSI_V0_VERSION)/csi.proto $(CSI_V0)/csi/v0
+	touch $@
+
+$(CSI_V1)-build-stamp: $(CSI_V1)-stamp
+	$(MKDIR_P) $(CSI_V1)/csi/v1
+	mv $(CSI_V1)/spec-$(CSI_V1_VERSION)/csi.proto $(CSI_V1)/csi/v1
+	touch $@
+
+# Mesos depends on CSI. Install the CSI proto file into $PREFIX/include but
+# don't add it to the source tarball.
+csi_v0dir = $(includedir)/csi/v0
+nodist_csi_v0_HEADERS = $(CSI_V0)/csi/v0/csi.proto
+$(nodist_csi_v0_HEADERS): $(CSI_V0)-build-stamp
+
+csi_v1dir = $(includedir)/csi/v1
+nodist_csi_v1_HEADERS = $(CSI_V1)/csi/v1/csi.proto
+$(nodist_csi_v1_HEADERS): $(CSI_V1)-build-stamp
+
+ALL_LOCAL += $(CSI_V0)-build-stamp
+ALL_LOCAL += $(CSI_V1)-build-stamp
 
 # Convenience library for gmock/gtest.
 check_LTLIBRARIES = libgmock.la

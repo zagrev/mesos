@@ -101,6 +101,9 @@ struct Framework
   bool publishPerFrameworkMetrics;
 
   process::Owned<FrameworkMetrics> metrics;
+
+  // TODO(bbannier): Consider documenting examples on how to use this setting.
+  hashmap<std::string, std::vector<ResourceQuantities>> minAllocatableResources;
 };
 
 
@@ -472,7 +475,10 @@ protected:
       const FrameworkID& frameworkID,
       const SlaveID& slaveID) const;
 
-  bool allocatable(const Resources& resources);
+  bool allocatable(
+      const Resources& resources,
+      const std::string& role,
+      const Framework& framework) const;
 
   bool initialized;
   bool paused;
@@ -533,18 +539,25 @@ protected:
   // Specifically, we keep track of the roles when a framework subscribes to
   // the role, and/or when there are resources allocated to the role
   // (e.g. some tasks and/or executors are consuming resources under the role).
+  //
+  // NOTE: There is currently not a role entry when there is a
+  // reservation but no allocation / framework!
+  //
+  // TODO(bmahler): Turn this into a `hashmap<string, Role>` that
+  // also tracks a role if it has reservations.
   hashmap<std::string, hashset<FrameworkID>> roles;
 
-  // Configured quota for each role, if any. If a role does not have
-  // an entry here it has the default quota of (no guarantee, no limit).
-  hashmap<std::string, Quota> quotas;
+  // Configured guaranteed resource quantities for each role, if any.
+  // If a role does not have an entry here it has (the default)
+  // no guarantee.
+  hashmap<std::string, ResourceQuantities> quotaGuarantees;
 
   // Aggregated resource reservations on all agents tied to a
-  // particular role, if any. These are stripped scalar quantities
-  // that contain no meta-data.
+  // particular role, if any.
   //
-  // Only roles with non-empty reservations will be stored in the map.
-  hashmap<std::string, Resources> reservationScalarQuantities;
+  // Only roles with non-empty scalar reservation quantities will
+  // be stored in the map.
+  hashmap<std::string, ResourceQuantities> reservationScalarQuantities;
 
   // Slaves to send offers for.
   Option<hashset<std::string>> whitelist;

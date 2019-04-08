@@ -71,6 +71,9 @@
 #include "authentication/executor/jwt_secret_generator.hpp"
 
 #include "common/http.hpp"
+#include "common/protobuf_utils.hpp"
+
+#include "internal/devolve.hpp"
 
 #include "messages/messages.hpp" // For google::protobuf::Message.
 
@@ -1438,12 +1441,17 @@ inline typename TOffer::Operation CREATE_DISK(
 }
 
 
-template <typename TResource, typename TOffer>
-inline typename TOffer::Operation DESTROY_DISK(const TResource& source)
+template <typename TResource, typename TOperationID, typename TOffer>
+inline typename TOffer::Operation DESTROY_DISK(
+    const TResource& source, const Option<TOperationID>& operationId = None())
 {
   typename TOffer::Operation operation;
   operation.set_type(TOffer::Operation::DESTROY_DISK);
   operation.mutable_destroy_disk()->mutable_source()->CopyFrom(source);
+
+  if (operationId.isSome()) {
+    operation.mutable_id()->CopyFrom(operationId.get());
+  }
 
   return operation;
 }
@@ -1818,7 +1826,8 @@ inline Offer::Operation CREATE_DISK(Args&&... args)
 template <typename... Args>
 inline Offer::Operation DESTROY_DISK(Args&&... args)
 {
-  return common::DESTROY_DISK<Resource, Offer>(std::forward<Args>(args)...);
+  return common::DESTROY_DISK<Resource, OperationID, Offer>(
+      std::forward<Args>(args)...);
 }
 
 
@@ -2125,8 +2134,10 @@ inline mesos::v1::Offer::Operation CREATE_DISK(Args&&... args)
 template <typename... Args>
 inline mesos::v1::Offer::Operation DESTROY_DISK(Args&&... args)
 {
-  return common::DESTROY_DISK<mesos::v1::Resource, mesos::v1::Offer>(
-      std::forward<Args>(args)...);
+  return common::DESTROY_DISK<
+      mesos::v1::Resource,
+      mesos::v1::OperationID,
+      mesos::v1::Offer>(std::forward<Args>(args)...);
 }
 
 
@@ -2668,6 +2679,15 @@ MATCHER_P(OffersHaveAnyResource, filter, "")
 }
 
 
+// This matcher is used to match the operation ID of an
+// `Event.update_operation_status.status` message.
+MATCHER_P(OperationStatusUpdateOperationIdEq, operationId, "")
+{
+  return arg.status().has_operation_id() &&
+    arg.status().operation_id() == operationId;
+}
+
+
 // Like LaunchTasks, but decline the entire offer and don't launch any tasks.
 ACTION(DeclineOffers)
 {
@@ -3163,12 +3183,13 @@ public:
         break;
     }
 
-    if (update->has_status()) {
-      update->mutable_status()->mutable_resource_provider_id()->CopyFrom(
-          info.id());
+    update->mutable_status()->mutable_uuid()->set_value(
+        id::UUID::random().toString());
 
-      update->mutable_latest_status()->CopyFrom(update->status());
-    }
+    update->mutable_status()->mutable_resource_provider_id()->CopyFrom(
+        info.id());
+
+    update->mutable_latest_status()->CopyFrom(update->status());
 
     driver->send(call);
   }
@@ -3647,6 +3668,14 @@ MATCHER_P(TaskStatusUpdateTaskIdEq, taskInfo, "")
 MATCHER_P(TaskStatusUpdateStateEq, taskState, "")
 {
   return arg.status().state() == taskState;
+}
+
+
+// This matcher is used to match an `Event.update.status` message whose state is
+// terminal.
+MATCHER(TaskStatusUpdateIsTerminalState, "")
+{
+  return protobuf::isTerminalState(devolve(arg.status()).state());
 }
 
 

@@ -50,6 +50,7 @@ using http::Accepted;
 using http::BadRequest;
 using http::Conflict;
 using http::Forbidden;
+using http::NotImplemented;
 using http::OK;
 
 using mesos::authorization::createSubject;
@@ -186,63 +187,48 @@ private:
 };
 
 
-Option<Error> Master::QuotaHandler::capacityHeuristic(
-    const QuotaInfo& request) const
+Option<Error> Master::QuotaHandler::overcommitCheck(
+    const vector<Resources>& agents,
+    const hashmap<string, Quota>& quotas,
+    const QuotaInfo& request)
 {
-  VLOG(1) << "Performing capacity heuristic check for a set quota request";
+  ResourceQuantities totalQuota = ResourceQuantities::fromScalarResources(
+      [&]() {
+        QuotaTree quotaTree({});
 
-  // This should have been validated earlier.
-  CHECK(master->isWhitelistedRole(request.role()));
-  CHECK(!master->quotas.contains(request.role()));
+        foreachpair (const string& role, const Quota& quota, quotas) {
+          if (role != request.role()) {
+            quotaTree.insert(role, quota);
+          }
+        }
 
-  hashmap<string, Quota> quotaMap = master->quotas;
+        quotaTree.insert(request.role(), Quota{request});
 
-  // Check that adding the requested quota to the existing quotas does
-  // not violate the capacity heuristic.
-  quotaMap[request.role()] = Quota{request};
+        // Hard CHECK since this is already validated earlier
+        // during request validation.
+        CHECK_NONE(quotaTree.validate());
 
-  QuotaTree quotaTree(quotaMap);
+        return quotaTree.total();
+      }());
 
-  CHECK_NONE(quotaTree.validate());
+  // Determine whether quota overcommits the cluster.
+  ResourceQuantities capacity;
 
-  Resources totalQuota = quotaTree.total();
-
-  // Determine whether the total quota, including the new request, does
-  // not exceed the sum of non-static cluster resources.
-  //
-  // NOTE: We do not necessarily calculate the full sum of non-static
-  // cluster resources. We apply the early termination logic as it can
-  // reduce the cost of the function significantly. This early exit does
-  // not influence the declared inequality check.
-  Resources nonStaticClusterResources;
-  foreachvalue (Slave* slave, master->slaves.registered) {
-    // We do not consider disconnected or inactive agents, because they
-    // do not participate in resource allocation.
-    if (!slave->connected || !slave->active) {
-      continue;
-    }
-
-    // NOTE: Dynamic reservations are not excluded here because they do
-    // not show up in `SlaveInfo` resources. In contrast to static
-    // reservations, dynamic reservations may be unreserved at any time,
-    // hence making resources available for quota'ed frameworks.
-    Resources nonStaticAgentResources =
-      Resources(slave->info.resources()).unreserved();
-
-    nonStaticClusterResources += nonStaticAgentResources;
-
-    // If we have found enough resources to satisfy the inequality, then
-    // we can return early.
-    if (nonStaticClusterResources.contains(totalQuota)) {
-      return None();
-    }
+  foreach (const Resources& agent, agents) {
+    capacity += ResourceQuantities::fromScalarResources(
+        agent.nonRevocable().scalars());
   }
 
-  // If we reached this point, there are not enough available resources
-  // in the cluster, hence the request does not pass the heuristic.
-  return Error(
-      "Not enough available cluster capacity to reasonably satisfy quota "
-      "request; the force flag can be used to override this check");
+  if (!capacity.contains(totalQuota)) {
+    // TODO(bmahler): Specialize this message based on whether
+    // this request leads to the overcommit vs the quota was
+    // already overcommitted.
+    return Error(
+        "Total quota guarantees '" + stringify(totalQuota) + "'"
+        " exceed cluster capacity '" + stringify(capacity) + "'");
+  }
+
+  return None();
 }
 
 
@@ -418,6 +404,43 @@ Future<QuotaStatus> Master::QuotaHandler::_status(
 }
 
 
+Future<http::Response> Master::QuotaHandler::update(
+    const mesos::master::Call& call, const Option<Principal>& principal) const
+{
+  CHECK_EQ(mesos::master::Call::UPDATE_QUOTA, call.type());
+  CHECK(call.has_update_quota());
+
+  // Validate `QuotaConfig`.
+  foreach (auto&& config, call.update_quota().quota_configs()) {
+    // Check that the role is on the role whitelist, if it exists.
+    if (!master->isWhitelistedRole(config.role())) {
+      return BadRequest(
+          "Invalid QuotaConfig: '" + config.role() + "'"
+          " is not on the roles whitelist");
+    }
+
+    // Setting quota on a nested role is temporarily disabled.
+    //
+    // TODO(mzhu): Remove this check when MESOS-7402 is fixed.
+    bool nestedRole = strings::contains(config.role(), "/");
+    if (nestedRole) {
+      return BadRequest(
+          "Updating quota on nested role '" + config.role() +
+          "' is not supported yet");
+    }
+
+    Option<Error> error = quota::validate(config);
+
+    if (error.isSome()) {
+      return BadRequest(
+          "Invalid QuotaConfig: " + error->message);
+    }
+  }
+
+  return NotImplemented();
+}
+
+
 Future<http::Response> Master::QuotaHandler::set(
     const mesos::master::Call& call,
     const Option<Principal>& principal) const
@@ -507,15 +530,19 @@ Future<http::Response> Master::QuotaHandler::_set(
         " for role '" + quotaInfo.role() + "' which already has quota");
   }
 
-  hashmap<string, Quota> quotaMap = master->quotas;
-
   // Validate that adding this quota does not violate the hierarchical
   // relationship between quotas.
-  quotaMap[quotaInfo.role()] = Quota{quotaInfo};
-
-  QuotaTree quotaTree(quotaMap);
-
   {
+    QuotaTree quotaTree({});
+
+    foreachpair (const string& role, const Quota& quota, master->quotas) {
+      if (role != quotaInfo.role()) {
+        quotaTree.insert(role, quota);
+      }
+    }
+
+    quotaTree.insert(quotaInfo.role(), Quota{quotaInfo});
+
     Option<Error> error = quotaTree.validate();
     if (error.isSome()) {
       return BadRequest(
@@ -532,7 +559,6 @@ Future<http::Response> Master::QuotaHandler::_set(
                       quotaInfo.role() + "' is not supported yet");
   }
 
-  // The force flag is used to overwrite the `capacityHeuristic` check.
   const bool forced = quotaRequest.force();
 
   if (principal.isSome()) {
@@ -558,11 +584,37 @@ Future<http::Response> Master::QuotaHandler::__set(
   if (forced) {
     VLOG(1) << "Using force flag to override quota capacity heuristic check";
   } else {
-    // Validate whether a quota request can be satisfied.
-    Option<Error> error = capacityHeuristic(quotaInfo);
+    // Check for quota overcommit. We include resources from all
+    // registered agents, even if they are disconnected.
+    //
+    // Disconnection tends to be a transient state (e.g. agent
+    // might be getting restarted as part of an upgrade, there
+    // might be a transient networking issue, etc), so excluding
+    // disconnected agents could produce an unstable capacity
+    // calculation.
+    //
+    // TODO(bmahler): In the same vein, include agents that
+    // are recovered from the registry but not yet registered.
+    // Because we currently exclude them, the calculated capacity
+    // is 0 immediately after a failover and slowly works its way
+    // up to the pre-failover capacity as the agents re-register.
+    vector<Resources> agents;
+    agents.reserve(master->slaves.registered.size());
+
+    foreachvalue (const Slave* agent, master->slaves.registered) {
+      agents.push_back(agent->totalResources);
+    }
+
+    // Validate whether quota overcommits the cluster capacity.
+    Option<Error> error = overcommitCheck(
+        agents,
+        master->quotas,
+        quotaInfo);
+
     if (error.isSome()) {
       return Conflict(
-          "Heuristic capacity check for set quota request failed: " +
+          "Quota guarantees overcommit the cluster"
+          " (use 'force' to bypass this check): " +
           error->message);
     }
   }

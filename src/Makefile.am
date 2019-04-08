@@ -26,7 +26,8 @@ include ../3rdparty/versions.am
 # them include $(top_builddir) as appropriate.
 BOOST = 3rdparty/boost-$(BOOST_VERSION)
 CONCURRENTQUEUE = 3rdparty/concurrentqueue-$(CONCURRENTQUEUE_VERSION)
-CSI = 3rdparty/csi-$(CSI_VERSION)
+CSI_V0 = 3rdparty/csi-$(CSI_V0_VERSION)
+CSI_V1 = 3rdparty/csi-$(CSI_V1_VERSION)
 ELFIO = 3rdparty/elfio-$(ELFIO_VERSION)
 GLOG = 3rdparty/glog-$(GLOG_VERSION)
 GMOCK = $(GOOGLETEST)/googlemock
@@ -139,6 +140,9 @@ MESOS_CPPFLAGS += -I../include
 # Protobuf headers that depend on mesos.pb.h need this.
 MESOS_CPPFLAGS += -I../include/mesos
 
+# Set up include paths for the protocol buffer compiler.
+PROTOCFLAGS = -I$(top_srcdir)/include -I$(srcdir) -I../$(CSI_V0) -I../$(CSI_V1)
+
 # Header only dependencies will be ignored for --disable-bundled.
 #
 # For non-convenience libraries we need to link them in to make the shared
@@ -247,10 +251,12 @@ if WITH_BUNDLED_PROTOBUF
 MESOS_CPPFLAGS += -I../$(PROTOBUF)/src
 LIB_PROTOBUF = ../$(PROTOBUF)/src/libprotobuf.la
 PROTOC = ../$(PROTOBUF)/src/protoc
+PROTOCFLAGS += -I../$(PROTOBUF)/src
 else
 LIB_PROTOBUF = -lprotobuf
 LDADD += -lprotobuf
 PROTOC = @PROTOCOMPILER@
+PROTOCFLAGS += @PROTOBUF_PROTOCFLAGS@
 endif
 
 if WITH_BUNDLED_RAPIDJSON
@@ -270,15 +276,6 @@ LIB_ZOOKEEPER = -lzookeeper_mt
 LDADD += -lzookeeper_mt
 endif
 
-# Set up include paths for the protocol buffer compiler.
-PROTOCFLAGS = -I$(top_srcdir)/include -I$(srcdir) -I../$(CSI)
-
-# TODO(josephw): This is a temporary include directory which points to the
-# generated CSI protocol buffer code. Derivative protocol buffers need
-# this include in order to build. When the 3rdparty CSI repo builds its own
-# generated code, this can be changed to include that directory instead.
-MESOS_CPPFLAGS += -I../include/csi
-
 # README: we build the Mesos library out of a collection of
 # convenience libraries (that is, libraries that do not get installed
 # but we can use as building blocks to vary compile flags as necessary
@@ -294,6 +291,7 @@ APPC_SPEC_PROTO = $(top_srcdir)/include/mesos/appc/spec.proto
 AUTHENTICATION_PROTO = $(top_srcdir)/include/mesos/authentication/authentication.proto
 AUTHORIZATION_PROTO = $(top_srcdir)/include/mesos/authorizer/authorizer.proto
 CONTAINERIZER_PROTO = $(top_srcdir)/include/mesos/slave/containerizer.proto
+CSI_TYPES_PROTO = $(top_srcdir)/include/mesos/csi/types.proto
 DOCKER_SPEC_PROTO = $(top_srcdir)/include/mesos/docker/spec.proto
 DOCKER_V1_PROTO = $(top_srcdir)/include/mesos/docker/v1.proto
 DOCKER_V2_PROTO = $(top_srcdir)/include/mesos/docker/v2.proto
@@ -414,17 +412,25 @@ CXX_PROTOS +=								\
   slave/containerizer/mesos/isolators/docker/volume/state.pb.cc		\
   slave/containerizer/mesos/isolators/docker/volume/state.pb.h		\
   slave/containerizer/mesos/isolators/network/cni/spec.pb.cc		\
-  slave/containerizer/mesos/isolators/network/cni/spec.pb.h
+  slave/containerizer/mesos/isolators/network/cni/spec.pb.h		\
+  slave/volume_gid_manager/state.pb.cc					\
+  slave/volume_gid_manager/state.pb.h
 
 CXX_PROTOS +=								\
   resource_provider/storage/disk_profile.pb.cc				\
   resource_provider/storage/disk_profile.pb.h
 
 CXX_CSI_PROTOS =							\
-  ../include/csi/csi.grpc.pb.cc						\
-  ../include/csi/csi.grpc.pb.h						\
-  ../include/csi/csi.pb.cc						\
-  ../include/csi/csi.pb.h						\
+  ../include/csi/v0/csi.grpc.pb.cc					\
+  ../include/csi/v0/csi.grpc.pb.h					\
+  ../include/csi/v0/csi.pb.cc						\
+  ../include/csi/v0/csi.pb.h						\
+  ../include/csi/v1/csi.grpc.pb.cc					\
+  ../include/csi/v1/csi.grpc.pb.h					\
+  ../include/csi/v1/csi.pb.cc						\
+  ../include/csi/v1/csi.pb.h						\
+  ../include/mesos/csi/types.pb.cc					\
+  ../include/mesos/csi/types.pb.h					\
   csi/state.pb.cc							\
   csi/state.pb.h
 
@@ -494,14 +500,13 @@ CLEANFILES +=								\
 %.pb.cc %.pb.h: %.proto
 	$(PROTOC) $(PROTOCFLAGS) --cpp_out=. $^
 
-../include/csi/%.pb.cc ../include/csi/%.pb.h: ../$(CSI)/%.proto
-	$(MKDIR_P) $(@D)
-	$(PROTOC) $(PROTOCFLAGS) --cpp_out=../include/csi $^
+../include/%.grpc.pb.cc ../include/%.grpc.pb.h ../include/%.pb.cc ../include/%.pb.h: ../$(CSI_V0)/%.proto
+	$(PROTOC) $(PROTOCFLAGS) --cpp_out=../include --grpc_out=../include	\
+		--plugin=protoc-gen-grpc=$(GRPC_CPP_PLUGIN) $^
 
-../include/csi/%.grpc.pb.cc ../include/csi/%.grpc.pb.h: ../$(CSI)/%.proto
-	$(MKDIR_P) $(@D)
-	$(PROTOC) $(PROTOCFLAGS) --grpc_out=../include/csi $^		\
-	          --plugin=protoc-gen-grpc=$(GRPC_CPP_PLUGIN)
+../include/%.grpc.pb.cc ../include/%.grpc.pb.h ../include/%.pb.cc ../include/%.pb.h: ../$(CSI_V1)/%.proto
+	$(PROTOC) $(PROTOCFLAGS) --cpp_out=../include --grpc_out=../include	\
+		--plugin=protoc-gen-grpc=$(GRPC_CPP_PLUGIN) $^
 
 # Targets for generating Java protocol buffer code.
 java/generated/org/apache/mesos/executor/Protos.java: $(EXECUTOR_PROTO)
@@ -699,6 +704,30 @@ authorizer_HEADERS =							\
 nodist_authorizer_HEADERS =						\
   ../include/mesos/authorizer/acls.pb.h					\
   ../include/mesos/authorizer/authorizer.pb.h
+
+csidir = $(pkgincludedir)/csi
+
+csi_HEADERS =								\
+  $(top_srcdir)/include/mesos/csi/types.hpp				\
+  $(top_srcdir)/include/mesos/csi/types.proto				\
+  $(top_srcdir)/include/mesos/csi/v0.hpp				\
+  $(top_srcdir)/include/mesos/csi/v1.hpp
+
+nodist_csi_HEADERS =							\
+  ../include/mesos/csi/types.pb.h
+
+# Install the generated CSI headers into $PREFIX/include.
+csi_v0dir = $(includedir)/csi/v0
+
+nodist_csi_v0_HEADERS =							\
+  ../include/csi/v0/csi.grpc.pb.h					\
+  ../include/csi/v0/csi.pb.h
+
+csi_v1dir = $(includedir)/csi/v1
+
+nodist_csi_v1_HEADERS =							\
+  ../include/csi/v1/csi.grpc.pb.h					\
+  ../include/csi/v1/csi.pb.h
 
 dockerdir = $(pkgincludedir)/docker
 
@@ -1002,7 +1031,8 @@ libmesos_no_3rdparty_la_SOURCES =					\
   slave/state.proto							\
   slave/containerizer/mesos/provisioner/docker/message.proto		\
   slave/containerizer/mesos/isolators/docker/volume/state.proto		\
-  slave/containerizer/mesos/isolators/network/cni/spec.proto
+  slave/containerizer/mesos/isolators/network/cni/spec.proto		\
+  slave/volume_gid_manager/state.proto
 
 # TODO(tillt): Remove authentication/cram_md5/* which will enable us to
 # lose the immediate cyrus-sasl2 dependency.
@@ -1287,6 +1317,9 @@ libmesos_no_3rdparty_la_SOURCES +=					\
   slave/task_status_update_manager.hpp					\
   slave/validation.cpp							\
   slave/validation.hpp							\
+  slave/volume_gid_manager/state.hpp					\
+  slave/volume_gid_manager/volume_gid_manager.cpp			\
+  slave/volume_gid_manager/volume_gid_manager.hpp			\
   slave/windows_ctrlhandler.hpp						\
   status_update_manager/operation.cpp					\
   status_update_manager/operation.hpp					\
@@ -1409,6 +1442,8 @@ MESOS_LINUX_FILES =									\
   slave/containerizer/mesos/isolators/volume/image.hpp					\
   slave/containerizer/mesos/isolators/volume/secret.cpp					\
   slave/containerizer/mesos/isolators/volume/secret.hpp					\
+  slave/containerizer/mesos/isolators/volume/utils.cpp					\
+  slave/containerizer/mesos/isolators/volume/utils.hpp					\
   slave/containerizer/mesos/provisioner/backends/aufs.cpp				\
   slave/containerizer/mesos/provisioner/backends/aufs.hpp				\
   slave/containerizer/mesos/provisioner/backends/bind.cpp				\
@@ -1432,6 +1467,12 @@ MESOS_LINUX_FILES +=							\
   linux/seccomp/seccomp_parser.hpp					\
   slave/containerizer/mesos/isolators/linux/seccomp.cpp			\
   slave/containerizer/mesos/isolators/linux/seccomp.hpp
+endif
+
+if ENABLE_LAUNCHER_SEALING
+MESOS_LINUX_FILES +=							\
+  linux/memfd.cpp							\
+  linux/memfd.hpp
 endif
 
 if ENABLE_LINUX_ROUTING
@@ -1502,8 +1543,7 @@ libmesos_no_3rdparty_la_SOURCES +=					\
   resource_provider/storage/disk_profile_utils.cpp			\
   resource_provider/storage/disk_profile_utils.hpp			\
   resource_provider/storage/provider.cpp				\
-  resource_provider/storage/provider.hpp				\
-  resource_provider/storage/provider_process.hpp
+  resource_provider/storage/provider.hpp
 
 libmesos_no_3rdparty_la_CPPFLAGS = $(MESOS_CPPFLAGS)
 
@@ -1511,7 +1551,9 @@ libmesos_no_3rdparty_la_LIBADD = # Initialized to enable using +=.
 
 # Convenience library that *always* gets rebuilt to ensure accurate info.
 noinst_LTLIBRARIES += libbuild.la
-libbuild_la_SOURCES = common/build.cpp
+libbuild_la_SOURCES =							\
+  common/build.cpp							\
+  common/git_version.hpp
 libbuild_la_CPPFLAGS = $(AM_CPPFLAGS)
 libbuild_la_CPPFLAGS += $(MESOS_CPPFLAGS)
 libbuild_la_CPPFLAGS += -DBUILD_DATE="\"$$(date '+%Y-%m-%d %H:%M:%S')\""
@@ -1519,27 +1561,12 @@ libbuild_la_CPPFLAGS += -DBUILD_TIME="\"$$(date '+%s')\""
 libbuild_la_CPPFLAGS += -DBUILD_USER="\"$$USER\""
 libbuild_la_CPPFLAGS += -DBUILD_JAVA_JVM_LIBRARY=\"$(JAVA_JVM_LIBRARY)\"
 
-if GIT_REPO
-BUILD_GIT_SHA=$$(sh -c 'cd $(top_srcdir); \
-  SHA=`git log -n 1 --format=%H 2> /dev/null` && \
-  echo -DBUILD_GIT_SHA=\"$$SHA\"')
-libbuild_la_CPPFLAGS += $(BUILD_GIT_SHA)
-
-BUILD_GIT_BRANCH=$$(sh -c 'cd $(top_srcdir); \
-  BRANCH=`git symbolic-ref HEAD 2> /dev/null` && \
-  echo -DBUILD_GIT_BRANCH=\"$$BRANCH\"')
-libbuild_la_CPPFLAGS += $(BUILD_GIT_BRANCH)
-
-BUILD_GIT_TAG=$$(sh -c 'cd $(top_srcdir); \
-  TAG=`git describe --exact --tags 2> /dev/null` && \
-  echo -DBUILD_GIT_TAG=\"$$TAG\"')
-libbuild_la_CPPFLAGS += $(BUILD_GIT_TAG)
-endif
-
 # We need to escape the build flags properly.
 BUILD_FLAGS = $(echo $(MESOS_CPPFLAGS) $(CPPFLAGS) | $(SED) 's/\"/\\\"/g')	\
               $(echo $(AM_CFLAGS) $(CFLAGS) | $(SED) 's/\"/\\\"/g')		\
               $(echo $(AM_CXXFLAGS) $(CXXFLAGS) | $(SED) 's/\"/\\\"/g')
+
+EXTRA_DIST += common/git_version.hpp.in
 
 # TODO(benh): Provide other build flags.
 
@@ -1551,17 +1578,28 @@ libmesos_no_3rdparty_la_LIBADD += libbuild.la
 # Convenience library for build the CSI client.
 noinst_LTLIBRARIES += libcsi.la
 libcsi_la_SOURCES =							\
-  csi/client.cpp							\
-  csi/client.hpp							\
+  csi/types.cpp								\
+  csi/metrics.cpp							\
+  csi/metrics.hpp							\
   csi/paths.cpp								\
   csi/paths.hpp								\
-  csi/rpc.cpp								\
-  csi/rpc.hpp								\
+  csi/service_manager.cpp						\
+  csi/service_manager.hpp						\
   csi/state.hpp								\
   csi/state.proto							\
-  csi/utils.cpp								\
-  csi/utils.hpp								\
-  ../include/csi/spec.hpp
+  csi/v0.cpp								\
+  csi/v0_client.cpp							\
+  csi/v0_client.hpp							\
+  csi/v0_utils.cpp							\
+  csi/v0_utils.hpp							\
+  csi/v0_volume_manager.cpp						\
+  csi/v0_volume_manager.hpp						\
+  csi/v0_volume_manager_process.hpp					\
+  csi/v1.cpp								\
+  csi/v1_client.cpp							\
+  csi/v1_client.hpp							\
+  csi/volume_manager.cpp						\
+  csi/volume_manager.hpp
 
 nodist_libcsi_la_SOURCES = $(CXX_CSI_PROTOS)
 libcsi_la_CPPFLAGS = $(MESOS_CPPFLAGS)
@@ -1638,6 +1676,7 @@ libmesos_la_SOURCES =							\
   $(AUTHENTICATION_PROTO)						\
   $(AUTHORIZATION_PROTO)						\
   $(CONTAINERIZER_PROTO)						\
+  $(CSI_TYPES_PROTO)							\
   $(EXECUTOR_PROTO)							\
   $(DOCKER_SPEC_PROTO)							\
   $(DOCKER_V1_PROTO)							\
@@ -2273,6 +2312,11 @@ test_http_executor_SOURCES = examples/test_http_executor.cpp
 test_http_executor_CPPFLAGS = $(MESOS_CPPFLAGS)
 test_http_executor_LDADD = libmesos.la $(LDADD)
 
+check_PROGRAMS += operation-feedback-framework
+operation_feedback_framework_SOURCES = examples/operation_feedback_framework.cpp
+operation_feedback_framework_CPPFLAGS = $(MESOS_CPPFLAGS)
+operation_feedback_framework_LDADD = libmesos.la $(LDADD)
+
 check_PROGRAMS += long-lived-framework
 long_lived_framework_SOURCES = examples/long_lived_framework.cpp
 long_lived_framework_CPPFLAGS = $(MESOS_CPPFLAGS)
@@ -2491,6 +2535,7 @@ mesos_tests_SOURCES =						\
   tests/active_user_test_helper.cpp				\
   tests/active_user_test_helper.hpp				\
   tests/agent_container_api_tests.cpp				\
+  tests/agent_operation_feedback_tests.cpp			\
   tests/allocator.cpp				    \
   tests/allocator.hpp						\
   tests/anonymous_tests.cpp					\
@@ -2510,6 +2555,7 @@ mesos_tests_SOURCES =						\
   tests/cram_md5_authentication_tests.cpp			\
   tests/credentials_tests.cpp					\
   tests/csi_client_tests.cpp					\
+  tests/csi_utils_tests.cpp					\
   tests/default_executor_tests.cpp				\
   tests/disk_profile_adaptor_tests.cpp				\
   tests/disk_profile_server.hpp					\
@@ -2611,6 +2657,7 @@ mesos_tests_SOURCES =						\
   tests/utils.cpp						\
   tests/utils.hpp						\
   tests/values_tests.cpp					\
+  tests/volume_gid_manager_tests.cpp				\
   tests/zookeeper.hpp						\
   tests/zookeeper_test_server.hpp				\
   tests/zookeeper_url_tests.cpp					\
@@ -2716,6 +2763,11 @@ mesos_tests_SOURCES +=						\
   tests/containerizer/volume_secret_isolator_tests.cpp
 endif
 
+if ENABLE_LAUNCHER_SEALING
+mesos_tests_SOURCES +=						\
+  tests/containerizer/linux_memfd_tests.cpp
+endif
+
 if ENABLE_LINUX_ROUTING
 mesos_tests_SOURCES +=						\
   tests/containerizer/routing_tests.cpp
@@ -2788,6 +2840,7 @@ dist_check_SCRIPTS +=						\
   tests/java_v0_framework_test.sh				\
   tests/java_v1_framework_test.sh				\
   tests/no_executor_framework_test.sh				\
+  tests/operation_feedback_framework_test.sh			\
   tests/persistent_volume_framework_test.sh			\
   tests/python_framework_test.sh				\
   tests/test_http_framework_test.sh				\

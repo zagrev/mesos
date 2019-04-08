@@ -410,6 +410,11 @@ message FrameworkInfo {
   // the framework). These labels are not interpreted by Mesos itself.
   // Labels should not contain duplicate key-value pairs.
   optional Labels labels = 11;
+
+  // Specifc resource requirements for each of the framework's roles. This field
+  // is used by e.g., the default allocator to decide whether a framework is
+  // interested in seeing a resource of a certain shape.
+  map<string, OfferFilters> offer_filters = 13;
 }
 
 
@@ -827,6 +832,18 @@ message ExecutorInfo {
  * in the same zone, in different zones in the same region, or in
  * different regions. Note that all masters in a given Mesos cluster
  * must be in the same region.
+ *
+ * Complex deployments may have additional levels of hierarchy: for example,
+ * multiple racks might be grouped together into "halls" and multiple DCs in
+ * the same geographical vicinity might be grouped together. As a convention,
+ * the recommended way to represent additional levels of hierarchy is via dot-
+ * separated labels in the existing zone and region fields. For example, the
+ * fact that racks "abc" and "def" are in the same hall might be represented
+ * using the zone names "rack-abc.hall-1" and "rack-def.hall-1", for example.
+ * Software that is not aware of this additional structure will compare the
+ * zone names for equality- hence, the two zones will be treated as different
+ * (unrelated) zones. Software that is "hall-aware" can inspect the zone names
+ * and make use of the additional hierarchy.
  */
 message DomainInfo {
   message FaultDomain {
@@ -890,6 +907,13 @@ message MasterInfo {
   message Capability {
     enum Type {
       UNKNOWN = 0;
+
+      // NOTE: When the master starts to use a new capability that
+      // may prevent compatible downgrade, remember to add the
+      // capability to `Registry::MinimumCapability`. Conversely,
+      // the added minimum capability should be removed if the capability
+      // is deemed to be no longer required for compatible downgrade.
+      // See MESOS-8878 for more details.
 
       // The master can handle slaves whose state
       // changes after reregistering.
@@ -985,7 +1009,13 @@ message AgentInfo {
       // (1) The ability to report resources that are provided by some
       //     local resource providers through the resource provider API.
       //
-      // (2) The ability to provide operation feedback.
+      // (2) The ability to provide operation feedback. This also means
+      //     that this capability is a prerequisite for full support of
+      //     feedback for operations on agent default resources. If an
+      //     agent has the mandatory AGENT_OPERATION_FEEDBACK capability
+      //     set but not the RESOURCE_PROVIDER capability, then
+      //     operations on agent default resources which request feedback
+      //     will not be allowed.
       RESOURCE_PROVIDER = 4;
 
       // This expresses the capability for the agent to handle persistent volume
@@ -994,6 +1024,11 @@ message AgentInfo {
 
       // This expresses the ability of the agent to handle operation feedback
       // for operations on agent default resources.
+      //
+      // Note that full support for this feature also requires the
+      // RESOURCE_PROVIDER capability; if you would like the agent to
+      // handle feedback for operations on agent default resources, the
+      // RESOURCE_PROVIDER capability should be set as well.
       AGENT_OPERATION_FEEDBACK = 6;
     }
 
@@ -1873,6 +1908,34 @@ message PerfStatistics {
 
 
 /**
+ * Represents filters that allow a framework to control the shape of
+ * offers that will be sent to its role(s). These filters apply
+ * globally to any agent (unlike the existing `DECLINE` filter which
+ * us a time-based resource subset filter that only applies to the
+ * agent that was declined).
+ *
+ * NOTE: Custom allocators might interpret these fields in a different
+ * way, or not at all.
+ */
+message OfferFilters {
+  message ResourceQuantities {
+    // Quantities are pairs of identifiers of scalar resources and
+    // an associated value, e.g., `{"disk": Scalar {"value": 30}}`.
+    map<string, Value.Scalar> quantities = 1;
+  }
+
+  message MinAllocatableResources {
+    // A set of resources is considered allocatable if contained in any of
+    // the following quantities. If no quantities are specified any resource
+    // is considered allocatable.
+    repeated ResourceQuantities quantities = 1;
+  }
+
+  optional MinAllocatableResources min_allocatable_resources = 1;
+}
+
+
+/**
  * Describes a request for resources that can be used by a framework
  * to proactively influence the allocator.  If 'agent_id' is provided
  * then this request is assumed to only apply to resources on that
@@ -2017,7 +2080,7 @@ message Offer {
     message CreateDisk {
       required Resource source = 1;
 
-      // NOTE: Only `MOUNT` or `BLOCK` is allowed in the `target_type` field.
+      // NOTE: Only `MOUNT` or `BLOCK` is allowed in this field.
       required Resource.DiskInfo.Source.Type target_type = 2;
 
       // Apply the specified profile to the created disk. This field must be set
@@ -2028,18 +2091,20 @@ message Offer {
       optional string target_profile = 3;
     }
 
-    // Destroy a `MOUNT` or `BLOCK` disk resource backed by a CSI volume.
+    // Destroy a disk resource backed by a CSI volume.
     //
     // In the typical case where the CSI plugin of the volume supports volume
-    // deprovisioning and the profile of the disk resource is known to Mesos,
-    // the volume will be deprovisioned and a `RAW` disk resource with the same
-    // profile but no source ID will be returned. However, the following corner
-    // cases could lead to different outcomes:
+    // deprovisioning and the disk resource is a `MOUNT` or `BLOCK` disk with a
+    // profile known to Mesos, the volume will be deprovisioned and a `RAW` disk
+    // resource with the same profile but no source ID will be returned.
+    // However, the following scenarios could lead to different outcomes:
     //
     // (1) If the CSI plugin supports volume deprovisioning but the profile of
-    //     the disk resource is no longer reported by the disk profile adaptor,
-    //     the volume will be deprovisioned but no resource will be returned.
-    //
+    //     the disk resource is unknown to the disk profile adaptor, or the disk
+    //     resource is a `RAW` disk with no profile but a source ID (see above
+    //     for possible scenarios), the volume will be deprovisioned but no
+    //     resource will be returned.
+     //
     // (2) If the CSI plugin does not support volume deprovisioning, the volume
     //     won't be deprovisioned and a `RAW` disk resource with no profile but
     //     the same source ID will be returned.
@@ -2047,16 +2112,16 @@ message Offer {
     // NOTE: For the time being, this API is subject to change and the related
     // feature is experimental.
     message DestroyDisk {
-      // NOTE: Only a `MOUNT` or `BLOCK` disk is allowed in the `source` field.
+      // NOTE: Only a `MOUNT`, `BLOCK` or `RAW` disk is allowed in this field.
       required Resource source = 1;
     }
 
 
     optional Type type = 1;
 
-    // NOTE: The `id` field will allow frameworks to indicate that they wish to
-    // receive feedback about an operation. Since this feature is not yet
-    // implemented, the `id` field should NOT be set at present. See MESOS-8054.
+    // The `id` field allows frameworks to indicate that they wish to receive
+    // feedback about an operation via the UPDATE_OPERATION_STATUS event in the
+    // v1 scheduler API.
     optional OperationID id = 12; // EXPERIMENTAL.
 
     optional Launch launch = 2;
@@ -3151,6 +3216,15 @@ message SeccompInfo {
   // relative to the directory containing Seccomp profiles,
   // which is specified on the agent via the `--seccomp_config_dir` flag.
   optional string profile_name = 1;
+
+  // If set to `true`, Seccomp is not applied to the container.
+  // If not set or set to `false`, the container is launched with
+  // the profile specified in the `profile_name` field.
+  //
+  // NOTE: `profile_name` must not be specified if `unconfined` set to `true`.
+  // `profile_name` must be specified if `unconfined` is not set or
+  // is set to `false`.
+  optional bool unconfined = 2;
 }
 
 
@@ -3179,6 +3253,7 @@ message LinuxInfo {
   optional bool share_pid_namespace = 4;
 
   // Represents Seccomp configuration, which is used for syscall filtering.
+  // This field is used to override the agent's default Seccomp configuration.
   optional SeccompInfo seccomp = 5;
 }
 

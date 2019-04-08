@@ -74,6 +74,7 @@ public:
 
 #ifndef __WINDOWS__
   bool switch_user;
+  Option<std::string> volume_gid_range;
 #endif // __WINDOWS__
   Duration http_heartbeat_interval;
   std::string frameworks_home;  // TODO(benh): Make an Option.
@@ -112,6 +113,7 @@ public:
   Option<std::string> cgroups_net_cls_secondary_handles;
   Option<DeviceWhitelist> allowed_devices;
   Option<std::string> agent_subsystems;
+  Option<std::string> host_path_volume_force_creation;
   Option<std::vector<unsigned int>> nvidia_gpu_devices;
   Option<std::string> perf_events;
   Duration perf_interval;

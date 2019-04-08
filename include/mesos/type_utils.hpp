@@ -530,6 +530,23 @@ inline bool operator!=(
 }
 
 
+template <typename Key, typename Value>
+inline std::ostream& operator<<(
+  std::ostream& stream, const Map<Key, Value>& map)
+{
+  stream << "{ ";
+  for (auto it = map.cbegin(); it != map.end(); ++it) {
+    if (it != map.cbegin()) {
+      stream << ", ";
+    }
+    stream << it->first << ": " << it->second;
+  }
+  stream << " }";
+
+  return stream;
+}
+
+
 template <typename T>
 inline std::ostream& operator<<(
     std::ostream& stream,
@@ -634,6 +651,38 @@ struct hash<mesos::FrameworkID>
 
 
 template <>
+struct hash<mesos::Image::Type>
+{
+  typedef size_t result_type;
+
+  typedef mesos::Image::Type argument_type;
+
+  result_type operator()(const argument_type& imageType) const
+  {
+    // Use the underlying type of the enum as hash value.
+    return static_cast<size_t>(imageType);
+  }
+};
+
+
+template <>
+struct hash<mesos::MachineID>
+{
+  typedef size_t result_type;
+
+  typedef mesos::MachineID argument_type;
+
+  result_type operator()(const argument_type& machineId) const
+  {
+    size_t seed = 0;
+    boost::hash_combine(seed, strings::lower(machineId.hostname()));
+    boost::hash_combine(seed, machineId.ip());
+    return seed;
+  }
+};
+
+
+template <>
 struct hash<mesos::OfferID>
 {
   typedef size_t result_type;
@@ -644,6 +693,38 @@ struct hash<mesos::OfferID>
   {
     size_t seed = 0;
     boost::hash_combine(seed, offerId.value());
+    return seed;
+  }
+};
+
+
+template <>
+struct hash<mesos::OperationID>
+{
+  typedef size_t result_type;
+
+  typedef mesos::OperationID argument_type;
+
+  result_type operator()(const argument_type& operationId) const
+  {
+    size_t seed = 0;
+    boost::hash_combine(seed, operationId.value());
+    return seed;
+  }
+};
+
+
+template <>
+struct hash<mesos::ResourceProviderID>
+{
+  typedef size_t result_type;
+
+  typedef mesos::ResourceProviderID argument_type;
+
+  result_type operator()(const argument_type& resourceProviderId) const
+  {
+    size_t seed = 0;
+    boost::hash_combine(seed, resourceProviderId.value());
     return seed;
   }
 };
@@ -727,16 +808,17 @@ struct hash<mesos::TaskStatus_Reason>
 
 
 template <>
-struct hash<mesos::Image::Type>
+struct hash<mesos::UUID>
 {
   typedef size_t result_type;
 
-  typedef mesos::Image::Type argument_type;
+  typedef mesos::UUID argument_type;
 
-  result_type operator()(const argument_type& imageType) const
+  result_type operator()(const argument_type& uuid) const
   {
-    // Use the underlying type of the enum as hash value.
-    return static_cast<size_t>(imageType);
+    size_t seed = 0;
+    boost::hash_combine(seed, uuid.value());
+    return seed;
   }
 };
 
@@ -760,65 +842,18 @@ struct hash<std::pair<mesos::FrameworkID, mesos::ExecutorID>>
 
 
 template <>
-struct hash<mesos::MachineID>
+struct hash<std::pair<mesos::FrameworkID, mesos::OperationID>>
 {
   typedef size_t result_type;
 
-  typedef mesos::MachineID argument_type;
+  typedef std::pair<
+      mesos::FrameworkID, mesos::OperationID> argument_type;
 
-  result_type operator()(const argument_type& machineId) const
+  result_type operator()(const argument_type& pair) const
   {
     size_t seed = 0;
-    boost::hash_combine(seed, strings::lower(machineId.hostname()));
-    boost::hash_combine(seed, machineId.ip());
-    return seed;
-  }
-};
-
-
-template <>
-struct hash<mesos::OperationID>
-{
-  typedef size_t result_type;
-
-  typedef mesos::OperationID argument_type;
-
-  result_type operator()(const argument_type& operationId) const
-  {
-    size_t seed = 0;
-    boost::hash_combine(seed, operationId.value());
-    return seed;
-  }
-};
-
-
-template <>
-struct hash<mesos::ResourceProviderID>
-{
-  typedef size_t result_type;
-
-  typedef mesos::ResourceProviderID argument_type;
-
-  result_type operator()(const argument_type& resourceProviderId) const
-  {
-    size_t seed = 0;
-    boost::hash_combine(seed, resourceProviderId.value());
-    return seed;
-  }
-};
-
-
-template <>
-struct hash<mesos::UUID>
-{
-  typedef size_t result_type;
-
-  typedef mesos::UUID argument_type;
-
-  result_type operator()(const argument_type& uuid) const
-  {
-    size_t seed = 0;
-    boost::hash_combine(seed, uuid.value());
+    boost::hash_combine(seed, std::hash<mesos::FrameworkID>()(pair.first));
+    boost::hash_combine(seed, std::hash<mesos::OperationID>()(pair.second));
     return seed;
   }
 };

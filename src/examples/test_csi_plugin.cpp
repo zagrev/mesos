@@ -18,14 +18,14 @@
 #include <thread>
 #include <utility>
 
-#include <csi/spec.hpp>
-
 #include <grpcpp/grpcpp.h>
 
 #include <grpcpp/generic/async_generic_service.h>
 #include <grpcpp/generic/generic_stub.h>
 
 #include <mesos/type_utils.hpp>
+
+#include <mesos/csi/v0.hpp>
 
 #include <stout/bytes.hpp>
 #include <stout/flags.hpp>
@@ -41,7 +41,7 @@
 #include <stout/os/mkdir.hpp>
 #include <stout/os/rmdir.hpp>
 
-#include "csi/utils.hpp"
+#include "csi/v0_utils.hpp"
 
 #include "linux/fs.hpp"
 

@@ -55,6 +55,10 @@
 
 #include "hook/manager.hpp"
 
+#ifdef ENABLE_LAUNCHER_SEALING
+#include "linux/memfd.hpp"
+#endif // ENABLE_LAUNCHER_SEALING
+
 #include "module/manager.hpp"
 
 #include "slave/gc.hpp"
@@ -172,7 +176,8 @@ Try<MesosContainerizer*> MesosContainerizer::create(
     Fetcher* fetcher,
     GarbageCollector* gc,
     SecretResolver* secretResolver,
-    const Option<NvidiaComponents>& nvidia)
+    const Option<NvidiaComponents>& nvidia,
+    VolumeGidManager* volumeGidManager)
 {
   Try<hashset<string>> isolations = [&flags]() -> Try<hashset<string>> {
     const vector<string> tokens(strings::tokenize(flags.isolation, ","));
@@ -366,13 +371,29 @@ Try<MesosContainerizer*> MesosContainerizer::create(
     // Filesystem isolators.
 
 #ifdef __WINDOWS__
-    {"filesystem/windows", &WindowsFilesystemIsolatorProcess::create},
+    {"filesystem/windows",
+      [volumeGidManager] (const Flags& flags) -> Try<Isolator*> {
+        return WindowsFilesystemIsolatorProcess::create(
+            flags,
+            volumeGidManager);
+      }},
 #else
-    {"filesystem/posix", &PosixFilesystemIsolatorProcess::create},
+    {"filesystem/posix",
+      [volumeGidManager] (const Flags& flags) -> Try<Isolator*> {
+        return PosixFilesystemIsolatorProcess::create(
+            flags,
+            volumeGidManager);
+      }},
 #endif // __WINDOWS__
 
 #ifdef __linux__
-    {"filesystem/linux", &LinuxFilesystemIsolatorProcess::create},
+    {"filesystem/linux",
+      [volumeGidManager] (const Flags& flags) -> Try<Isolator*> {
+        return LinuxFilesystemIsolatorProcess::create(
+            flags,
+            volumeGidManager);
+      }},
+
     // TODO(jieyu): Deprecate this in favor of using filesystem/linux.
     {"filesystem/shared", &SharedFilesystemIsolatorProcess::create},
 #endif // __linux__
@@ -417,7 +438,12 @@ Try<MesosContainerizer*> MesosContainerizer::create(
     // Volume isolators.
 
 #ifndef __WINDOWS__
-    {"volume/sandbox_path", &VolumeSandboxPathIsolatorProcess::create},
+    {"volume/sandbox_path",
+      [volumeGidManager] (const Flags& flags) -> Try<Isolator*> {
+        return VolumeSandboxPathIsolatorProcess::create(
+            flags,
+            volumeGidManager);
+      }},
 #endif // __WINDOWS__
 
 #ifdef __linux__
@@ -558,7 +584,8 @@ Try<MesosContainerizer*> MesosContainerizer::create(
       gc,
       Owned<Launcher>(launcher.get()),
       provisioner,
-      isolators);
+      isolators,
+      volumeGidManager);
 }
 
 
@@ -569,7 +596,8 @@ Try<MesosContainerizer*> MesosContainerizer::create(
     GarbageCollector* gc,
     const Owned<Launcher>& launcher,
     const Shared<Provisioner>& provisioner,
-    const vector<Owned<Isolator>>& isolators)
+    const vector<Owned<Isolator>>& isolators,
+    VolumeGidManager* volumeGidManager)
 {
   // Add I/O switchboard to the isolator list.
   //
@@ -587,6 +615,37 @@ Try<MesosContainerizer*> MesosContainerizer::create(
   _isolators.push_back(Owned<Isolator>(new MesosIsolator(
       Owned<MesosIsolatorProcess>(ioSwitchboard.get()))));
 
+  Option<int_fd> initMemFd;
+  Option<int_fd> commandExecutorMemFd;
+
+#ifdef ENABLE_LAUNCHER_SEALING
+  // Clone the launcher binary in memory for security concerns.
+  Try<int_fd> memFd = memfd::cloneSealedFile(
+      path::join(flags.launcher_dir, MESOS_CONTAINERIZER));
+
+  if (memFd.isError()) {
+    return Error(
+        "Failed to clone a sealed file '" +
+        path::join(flags.launcher_dir, MESOS_CONTAINERIZER) + "' in memory: " +
+        memFd.error());
+  }
+
+  initMemFd = memFd.get();
+
+  // Clone the command executor binary in memory for security.
+  memFd = memfd::cloneSealedFile(
+      path::join(flags.launcher_dir, MESOS_EXECUTOR));
+
+  if (memFd.isError()) {
+    return Error(
+        "Failed to clone a sealed file '" +
+        path::join(flags.launcher_dir, MESOS_EXECUTOR) + "' in memory: " +
+        memFd.error());
+  }
+
+  commandExecutorMemFd = memFd.get();
+#endif // ENABLE_LAUNCHER_SEALING
+
   return new MesosContainerizer(Owned<MesosContainerizerProcess>(
       new MesosContainerizerProcess(
           flags,
@@ -595,7 +654,10 @@ Try<MesosContainerizer*> MesosContainerizer::create(
           ioSwitchboard.get(),
           launcher,
           provisioner,
-          _isolators)));
+          _isolators,
+          volumeGidManager,
+          initMemFd,
+          commandExecutorMemFd)));
 }
 
 
@@ -1406,7 +1468,7 @@ Future<Nothing> MesosContainerizerProcess::prepare(
     const ContainerID& containerId,
     const Option<ProvisionInfo>& provisionInfo)
 {
-  // This is because if a 'destroy' happens during the provisoiner is
+  // This is because if a 'destroy' happens during the provisioner is
   // provisioning in '_launch', even if the '____destroy' will wait
   // for the 'provision' in '_launch' to finish, there is still a
   // chance that '____destroy' and its dependencies finish before
@@ -1628,6 +1690,17 @@ Future<Containerizer::LaunchResult> MesosContainerizerProcess::_launch(
     launchInfo.add_clone_namespaces(ns);
   }
 
+  // Remove duplicated entries in supplementary groups.
+  set<uint32_t> supplementaryGroups(
+      launchInfo.supplementary_groups().begin(),
+      launchInfo.supplementary_groups().end());
+
+  launchInfo.clear_supplementary_groups();
+
+  foreach (uint32_t gid, supplementaryGroups) {
+    launchInfo.add_supplementary_groups(gid);
+  }
+
   // Determine the launch command for the container.
   if (!launchInfo.has_command()) {
     launchInfo.mutable_command()->CopyFrom(container->config->command_info());
@@ -1658,35 +1731,49 @@ Future<Containerizer::LaunchResult> MesosContainerizerProcess::_launch(
   }
 
   // For command tasks specifically, we should add the task_environment
-  // flag to the launch command of the command executor.
+  // flag and the task_supplementary_groups flag to the launch command
+  // of the command executor.
   // TODO(tillt): Remove this once we no longer support the old style
   // command task (i.e., that uses mesos-execute).
-  if (container->config->has_task_info() && launchInfo.has_task_environment()) {
-    hashmap<string, string> commandTaskEnvironment;
+  if (container->config->has_task_info()) {
+    if (launchInfo.has_task_environment()) {
+      hashmap<string, string> commandTaskEnvironment;
 
-    foreach (const Environment::Variable& variable,
-             launchInfo.task_environment().variables()) {
-      const string& name = variable.name();
-      const string& value = variable.value();
-      if (commandTaskEnvironment.contains(name) &&
-          commandTaskEnvironment[name] != value) {
-        LOG(WARNING) << "Overwriting environment variable '" << name << "' "
-                     << "for container " << containerId;
+      foreach (const Environment::Variable& variable,
+               launchInfo.task_environment().variables()) {
+        const string& name = variable.name();
+        const string& value = variable.value();
+        if (commandTaskEnvironment.contains(name) &&
+            commandTaskEnvironment[name] != value) {
+          LOG(WARNING) << "Overwriting environment variable '" << name << "' "
+                       << "for container " << containerId;
+        }
+        // TODO(tillt): Consider making this 'secret' aware.
+        commandTaskEnvironment[name] = value;
       }
-      // TODO(tillt): Consider making this 'secret' aware.
-      commandTaskEnvironment[name] = value;
+
+      if (!commandTaskEnvironment.empty()) {
+        Environment taskEnvironment;
+        foreachpair (
+            const string& name, const string& value, commandTaskEnvironment) {
+          Environment::Variable* variable = taskEnvironment.add_variables();
+          variable->set_name(name);
+          variable->set_value(value);
+        }
+        launchInfo.mutable_command()->add_arguments(
+            "--task_environment=" + stringify(JSON::protobuf(taskEnvironment)));
+      }
     }
 
-    if (!commandTaskEnvironment.empty()) {
-      Environment taskEnvironment;
-      foreachpair (
-          const string& name, const string& value, commandTaskEnvironment) {
-        Environment::Variable* variable = taskEnvironment.add_variables();
-        variable->set_name(name);
-        variable->set_value(value);
-      }
+    if (launchInfo.task_supplementary_groups_size() > 0) {
+      // Remove duplicated entries in supplementary groups.
+      set<uint32_t> taskSupplementaryGroups(
+          launchInfo.task_supplementary_groups().begin(),
+          launchInfo.task_supplementary_groups().end());
+
       launchInfo.mutable_command()->add_arguments(
-          "--task_environment=" + stringify(JSON::protobuf(taskEnvironment)));
+          "--task_supplementary_groups=" +
+          strings::join(",", taskSupplementaryGroups));
     }
   }
 
@@ -1936,6 +2023,16 @@ Future<Containerizer::LaunchResult> MesosContainerizerProcess::_launch(
 
   const std::array<int_fd, 2>& pipes = pipes_.get();
 
+  vector<int_fd> whitelistFds{pipes[0], pipes[1]};
+
+  // Seal the command executor binary if needed.
+  if (container->config->has_task_info() && commandExecutorMemFd.isSome()) {
+    launchInfo.mutable_command()->set_value(
+        "/proc/self/fd/" + stringify(commandExecutorMemFd.get()));
+
+    whitelistFds.push_back(commandExecutorMemFd.get());
+  }
+
   // Prepare the flags to pass to the launch process.
   MesosContainerizerLaunch::Flags launchFlags;
 
@@ -1943,8 +2040,6 @@ Future<Containerizer::LaunchResult> MesosContainerizerProcess::_launch(
 
   launchFlags.pipe_read = pipes[0];
   launchFlags.pipe_write = pipes[1];
-
-  const vector<int_fd> whitelistFds{pipes[0], pipes[1]};
 
 #ifndef __WINDOWS__
   // Set the `runtime_directory` launcher flag so that the launch
@@ -2034,13 +2129,17 @@ Future<Containerizer::LaunchResult> MesosContainerizerProcess::_launch(
       launchFlagsEnvironment.end());
 
   // Fork the child using launcher.
+  string initPath = initMemFd.isSome()
+    ? ("/proc/self/fd/" + stringify(initMemFd.get()))
+    : path::join(flags.launcher_dir, MESOS_CONTAINERIZER);
+
   vector<string> argv(2);
   argv[0] = path::join(flags.launcher_dir, MESOS_CONTAINERIZER);
   argv[1] = MesosContainerizerLaunch::NAME;
 
   Try<pid_t> forked = launcher->fork(
       containerId,
-      argv[0],
+      initPath,
       argv,
       containerIO.get(),
       nullptr,
@@ -2652,6 +2751,41 @@ void MesosContainerizerProcess::____destroy(
     const Option<ContainerTermination>& termination)
 {
   CHECK(containers_.contains(containerId));
+
+#ifndef __WINDOWS__
+  if (volumeGidManager) {
+    const Owned<Container>& container = containers_.at(containerId);
+
+    if (container->config.isSome()) {
+      VLOG(1) << "Invoking volume gid manager to deallocate gid for container "
+              << containerId;
+
+      volumeGidManager->deallocate(container->config->directory())
+        .onAny(defer(self(), [=](const Future<Nothing>& future) {
+          CHECK(containers_.contains(containerId));
+
+          if (!future.isReady()) {
+            container->termination.fail(
+                "Failed to deallocate gid when destroying container: " +
+                (future.isFailed() ? future.failure() : "discarded future"));
+
+            ++metrics.container_destroy_errors;
+            return;
+          }
+
+          cleanupIsolators(containerId)
+            .onAny(defer(
+                self(),
+                &Self::_____destroy,
+                containerId,
+                termination,
+                lambda::_1));
+      }));
+
+      return;
+    }
+  }
+#endif // __WINDOWS__
 
   cleanupIsolators(containerId)
     .onAny(defer(

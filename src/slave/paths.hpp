@@ -73,36 +73,41 @@ namespace paths {
 //   |   |   |-- resources.target
 //   |   |   |-- resources_and_operations.state
 //   |   |-- slaves
-//   |       |-- latest (symlink)
-//   |       |-- <slave_id>
-//   |           |-- slave.info
-//   |           |-- resource_providers
-//   |           |   |-- <type>
-//   |           |       |-- <name>
-//   |           |           |-- latest (symlink)
-//   |           |           |-- <resource_provider_id>
-//   |           |               |-- resource_provider.state
-//   |           |               |-- operations
-//   |           |                   |-- <operation_uuid>
-//   |           |                       |-- operation.updates
-//   |           |-- frameworks
-//   |               |-- <framework_id>
-//   |                   |-- framework.info
-//   |                   |-- framework.pid
-//   |                   |-- executors
-//   |                       |-- <executor_id>
-//   |                           |-- executor.info
-//   |                           |-- runs
-//   |                               |-- latest (symlink)
-//   |                               |-- <container_id> (sandbox)
-//   |                                   |-- executor.sentinel (if completed)
-//   |                                   |-- pids
-//   |                                   |   |-- forked.pid
-//   |                                   |   |-- libprocess.pid
-//   |                                   |-- tasks
-//   |                                       |-- <task_id>
-//   |                                           |-- task.info
-//   |                                           |-- task.updates
+//   |   |   |-- latest (symlink)
+//   |   |   |-- <slave_id>
+//   |   |       |-- slave.info
+//   |   |       |-- operations
+//   |   |       |   |-- <operation_uuid>
+//   |   |       |       |-- operation.updates
+//   |   |       |-- resource_providers
+//   |   |       |   |-- <type>
+//   |   |       |       |-- <name>
+//   |   |       |           |-- latest (symlink)
+//   |   |       |           |-- <resource_provider_id>
+//   |   |       |               |-- resource_provider.state
+//   |   |       |               |-- operations
+//   |   |       |                   |-- <operation_uuid>
+//   |   |       |                       |-- operation.updates
+//   |   |       |-- frameworks
+//   |   |           |-- <framework_id>
+//   |   |               |-- framework.info
+//   |   |               |-- framework.pid
+//   |   |               |-- executors
+//   |   |                   |-- <executor_id>
+//   |   |                       |-- executor.info
+//   |   |                       |-- runs
+//   |   |                           |-- latest (symlink)
+//   |   |                           |-- <container_id> (sandbox)
+//   |   |                               |-- executor.sentinel (if completed)
+//   |   |                               |-- pids
+//   |   |                               |   |-- forked.pid
+//   |   |                               |   |-- libprocess.pid
+//   |   |                               |-- tasks
+//   |   |                                   |-- <task_id>
+//   |   |                                       |-- task.info
+//   |   |                                       |-- task.updates
+//   |   |-- volume_gid_manager
+//   |       |-- volume_gids
 //   |-- volumes
 //   |   |-- roles
 //   |       |-- <role>
@@ -359,8 +364,23 @@ Try<std::list<std::string>> getOperationPaths(
     const std::string& rootDir);
 
 
+// Returns all the directories in which status update streams for operations
+// affecting agent default resources are stored.
+Try<std::list<std::string>> getSlaveOperationPaths(
+    const std::string& metaDir,
+    const SlaveID& slaveId);
+
+
 std::string getOperationPath(
     const std::string& rootDir,
+    const id::UUID& operationUuid);
+
+
+// Returns the path of the directory in which the status update stream for a
+// given operation affecting agent default resources is stored.
+std::string getSlaveOperationPath(
+    const std::string& metaDir,
+    const SlaveID& slaveId,
     const id::UUID& operationUuid);
 
 
@@ -369,8 +389,24 @@ Try<id::UUID> parseOperationPath(
     const std::string& dir);
 
 
+// Extracts the operation UUID from the path of a directory in which the status
+// update stream for an operation affecting agent default resources is stored.
+Try<id::UUID> parseSlaveOperationPath(
+    const std::string& metaDir,
+    const SlaveID& slaveId,
+    const std::string& dir);
+
+
 std::string getOperationUpdatesPath(
     const std::string& rootDir,
+    const id::UUID& operationUuid);
+
+
+// Returns the path of the file to which the status update stream for a given
+// operation affecting agent default resources is stored.
+std::string getSlaveOperationUpdatesPath(
+    const std::string& metaDir,
+    const SlaveID& slaveId,
     const id::UUID& operationUuid);
 
 
@@ -399,6 +435,9 @@ std::string getPersistentVolumePath(
 std::string getPersistentVolumePath(
     const std::string& workDir,
     const Resource& resource);
+
+
+std::string getVolumeGidsPath(const std::string& rootDir);
 
 
 Try<std::string> createExecutorDirectory(

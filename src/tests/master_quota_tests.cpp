@@ -25,6 +25,7 @@
 
 #include <mesos/quota/quota.hpp>
 
+#include <process/clock.hpp>
 #include <process/future.hpp>
 #include <process/http.hpp>
 #include <process/id.hpp>
@@ -50,6 +51,8 @@ using google::protobuf::RepeatedPtrField;
 
 using mesos::internal::master::Master;
 
+using mesos::internal::master::allocator::MesosAllocatorProcess;
+
 using mesos::internal::slave::Slave;
 
 using mesos::master::detector::MasterDetector;
@@ -58,6 +61,7 @@ using mesos::quota::QuotaInfo;
 using mesos::quota::QuotaRequest;
 using mesos::quota::QuotaStatus;
 
+using process::Clock;
 using process::Future;
 using process::Owned;
 using process::PID;
@@ -266,55 +270,6 @@ TEST_F(MasterQuotaTest, InvalidSetRequest)
 }
 
 
-// v0 /quota requests and SET_QUOTA calls cannot specify a limit.
-TEST_F(MasterQuotaTest, V0WithLimitDisallowed)
-{
-  Try<Owned<cluster::Master>> master = StartMaster();
-  ASSERT_SOME(master);
-
-  // Ensure a /quota POST request with limit is rejected.
-  QuotaRequest quotaRequest;
-  quotaRequest.set_role("role");
-  *quotaRequest.mutable_guarantee() =
-    CHECK_NOTERROR(Resources::parse("cpus:10;mem:20"));
-  *quotaRequest.mutable_limit() =
-    CHECK_NOTERROR(Resources::parse("cpus:20;mem:40"));
-
-  process::http::Headers headers = createBasicAuthHeaders(DEFAULT_CREDENTIAL);
-
-  Future<Response> response = process::http::post(
-      master.get()->pid,
-      "quota",
-      headers,
-      string(jsonify(JSON::Protobuf(quotaRequest))));
-
-  AWAIT_EXPECT_RESPONSE_STATUS_EQ(BadRequest().status, response);
-  EXPECT_TRUE(strings::contains(
-      response->body,
-      "Setting QuotaInfo.limit is not supported"))
-    << response->body;
-
-  // Ensure a SET_QUOTA Call with limit is rejected.
-  mesos::master::Call call;
-  call.set_type(mesos::master::Call::SET_QUOTA);
-  *call.mutable_set_quota()->mutable_quota_request() = quotaRequest;
-
-  headers["Content-Type"] = APPLICATION_PROTOBUF;
-
-  response = process::http::post(
-      master.get()->pid,
-      "api/v1",
-      headers,
-      call.SerializeAsString());
-
-  AWAIT_EXPECT_RESPONSE_STATUS_EQ(BadRequest().status, response);
-  EXPECT_TRUE(strings::contains(
-      response->body,
-      "Setting QuotaInfo.limit is not supported"))
-    << response->body;
-}
-
-
 // Checks that a quota set request is not satisfied if an invalid
 // field is set or provided data are not supported.
 TEST_F(MasterQuotaTest, SetRequestWithInvalidData)
@@ -472,6 +427,8 @@ TEST_F(MasterQuotaTest, SetExistingQuota)
 // endpoint via a DELETE request against /quota.
 TEST_F(MasterQuotaTest, RemoveSingleQuota)
 {
+  Clock::pause();
+
   TestAllocator<> allocator;
   EXPECT_CALL(allocator, initialize(_, _, _));
 
@@ -517,8 +474,12 @@ TEST_F(MasterQuotaTest, RemoveSingleQuota)
 
     AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response);
 
+    // Ensure metrics update is finished.
+    Clock::settle();
+
     const string metricKey =
       "allocator/mesos/quota/roles/" + ROLE1 + "/resources/cpus/guarantee";
+
 
     JSON::Object metrics = Metrics();
 
@@ -536,6 +497,9 @@ TEST_F(MasterQuotaTest, RemoveSingleQuota)
 
     // Ensure that the quota remove request has reached the allocator.
     AWAIT_READY(receivedRemoveRequest);
+
+    // Ensure metrics update is finished.
+    Clock::settle();
 
     metrics = Metrics();
 
@@ -687,6 +651,11 @@ TEST_F(MasterQuotaTest, InsufficientResourcesSingleAgent)
         createRequestBody(ROLE1, quotaResources));
 
     AWAIT_EXPECT_RESPONSE_STATUS_EQ(Conflict().status, response);
+    EXPECT_EQ("Quota guarantees overcommit the cluster"
+              " (use 'force' to bypass this check): "
+              "Total quota guarantees 'cpus:3; mem:2048'"
+              " exceed cluster capacity 'cpus:2; disk:1024; mem:1024'",
+              response->body);
   }
 
   // Force flag should override the `capacityHeuristic` check and make the
@@ -762,6 +731,11 @@ TEST_F(MasterQuotaTest, InsufficientResourcesMultipleAgents)
         createRequestBody(ROLE1, quotaResources));
 
     AWAIT_EXPECT_RESPONSE_STATUS_EQ(Conflict().status, response);
+    EXPECT_EQ("Quota guarantees overcommit the cluster"
+              " (use 'force' to bypass this check):"
+              " Total quota guarantees 'cpus:5; mem:3072' exceed"
+              " cluster capacity 'cpus:4; disk:2048; mem:2048'",
+              response->body);
   }
 
   // Force flag should override the `capacityHeuristic` check and make the
@@ -802,6 +776,126 @@ TEST_F(MasterQuotaTest, AvailableResourcesSingleAgent)
   EXPECT_EQ(defaultAgentResources, agentTotalResources.get());
 
   // We request quota for a portion of resources available on the agent.
+  Resources quotaResources = Resources::parse("cpus:1;mem:512").get();
+  EXPECT_TRUE(agentTotalResources->contains(quotaResources));
+
+  // Send a quota request for the specified role.
+  Future<Quota> receivedQuotaRequest;
+  EXPECT_CALL(allocator, setQuota(Eq(ROLE1), _))
+    .WillOnce(DoAll(InvokeSetQuota(&allocator),
+                    FutureArg<1>(&receivedQuotaRequest)));
+
+  Future<Response> response = process::http::post(
+      master.get()->pid,
+      "quota",
+      createBasicAuthHeaders(DEFAULT_CREDENTIAL),
+      createRequestBody(ROLE1, quotaResources));
+
+  AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response);
+
+  // Quota request is granted and reached the allocator. Make sure nothing
+  // got lost in-between.
+  AWAIT_READY(receivedQuotaRequest);
+
+  EXPECT_EQ(ROLE1, receivedQuotaRequest->info.role());
+  EXPECT_EQ(quotaResources, receivedQuotaRequest->info.guarantee());
+}
+
+
+// Checks that the quota capacity heuristic includes
+// reservations. This means quota is potentially not
+// satisfiable! E.g. if all resources are reserved to
+// some role without any quota guarantee, the role with
+// quota guarantee won't be satisfied.
+TEST_F(MasterQuotaTest, AvailableResourcesSingleReservedAgent)
+{
+  TestAllocator<> allocator;
+  EXPECT_CALL(allocator, initialize(_, _, _));
+
+  Try<Owned<cluster::Master>> master = StartMaster(&allocator);
+  ASSERT_SOME(master);
+
+  // Start an agent and wait until its resources are available.
+  Future<Resources> agentTotalResources;
+  EXPECT_CALL(allocator, addSlave(_, _, _, _, _, _))
+    .WillOnce(DoAll(InvokeAddSlave(&allocator),
+                    FutureArg<4>(&agentTotalResources)));
+
+  slave::Flags flags = CreateSlaveFlags();
+  flags.resources = "cpus(other-role):1;mem(other-role):512";
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get(), flags);
+  ASSERT_SOME(slave);
+
+  AWAIT_READY(agentTotalResources);
+
+  // We request all resources on the agent, including reservations.
+  Resources quotaResources = Resources::parse("cpus:1;mem:512").get();
+
+  // Send a quota request for the specified role.
+  Future<Quota> receivedQuotaRequest;
+  EXPECT_CALL(allocator, setQuota(Eq(ROLE1), _))
+    .WillOnce(DoAll(InvokeSetQuota(&allocator),
+                    FutureArg<1>(&receivedQuotaRequest)));
+
+  Future<Response> response = process::http::post(
+      master.get()->pid,
+      "quota",
+      createBasicAuthHeaders(DEFAULT_CREDENTIAL),
+      createRequestBody(ROLE1, quotaResources));
+
+  AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response);
+
+  // Quota request is granted and reached the allocator. Make sure nothing
+  // got lost in-between.
+  AWAIT_READY(receivedQuotaRequest);
+
+  EXPECT_EQ(ROLE1, receivedQuotaRequest->info.role());
+  EXPECT_EQ(quotaResources, receivedQuotaRequest->info.guarantee());
+}
+
+
+// Checks that an operator can request quota when enough resources are
+// available on single disconnected agent.
+TEST_F(MasterQuotaTest, AvailableResourcesSingleDisconnectedAgent)
+{
+  TestAllocator<> allocator;
+  EXPECT_CALL(allocator, initialize(_, _, _));
+
+  Try<Owned<cluster::Master>> master = StartMaster(&allocator);
+  ASSERT_SOME(master);
+
+  // Start an agent and wait until its resources are available.
+  Future<Resources> agentTotalResources;
+  EXPECT_CALL(allocator, addSlave(_, _, _, _, _, _))
+    .WillOnce(DoAll(InvokeAddSlave(&allocator),
+                    FutureArg<4>(&agentTotalResources)));
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get());
+  ASSERT_SOME(slave);
+
+  AWAIT_READY(agentTotalResources);
+  EXPECT_EQ(defaultAgentResources, agentTotalResources.get());
+
+  // Make sure there are no agent registration retries in flight.
+  // Pausing also ensures the master does not continue to ping
+  // the agent once we spoof disconnection (which would trigger
+  // the agent to re-register).
+  Clock::pause();
+  Clock::settle();
+
+  // Spoof the agent disconnecting from the master.
+  Future<Nothing> deactivateSlave =
+    FUTURE_DISPATCH(_, &MesosAllocatorProcess::deactivateSlave);
+
+  process::inject::exited(slave.get()->pid, master.get()->pid);
+
+  AWAIT_READY(deactivateSlave);
+
+  // We request quota for a portion of resources available
+  // on the disconnected agent.
   Resources quotaResources = Resources::parse("cpus:1;mem:512").get();
   EXPECT_TRUE(agentTotalResources->contains(quotaResources));
 

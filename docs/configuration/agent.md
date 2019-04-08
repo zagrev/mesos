@@ -92,7 +92,8 @@ Example:
   </td>
   <td>
 JSON representation of agent features to whitelist. We always require
-'MULTI_ROLE', 'HIERARCHICAL_ROLE', and 'RESERVATION_REFINEMENT'.
+'MULTI_ROLE', 'HIERARCHICAL_ROLE', 'RESERVATION_REFINEMENT', and
+'AGENT_OPERATION_FEEDBACK'.
 <p/>
 Example:
 <pre><code>
@@ -100,7 +101,8 @@ Example:
     "capabilities": [
         {"type": "MULTI_ROLE"},
         {"type": "HIERARCHICAL_ROLE"},
-        {"type": "RESERVATION_REFINEMENT"}
+        {"type": "RESERVATION_REFINEMENT"},
+        {"type": "AGENT_OPERATION_FEEDBACK"}
     ]
 }
 </pre></code>
@@ -956,6 +958,17 @@ environment or find hadoop on <code>PATH</code>)
   </td>
 </tr>
 
+<tr id="host_path_volume_force_creation">
+  <td>
+    --host_path_volume_force_creation
+  </td>
+  <td>
+A colon-separated list of directories where descendant directories are
+allowed to be created by the <code>volume/host_path</code> isolator,
+if the directories do not exist.
+  </td>
+</tr>
+
 <tr id="http_credentials">
   <td>
     --http_credentials=VALUE
@@ -1503,6 +1516,19 @@ the agent is launched as a systemd unit.
   <td>
 The path to the systemd system run time directory.
 (default: /run/systemd/system)
+  </td>
+</tr>
+<tr>
+  <td>
+    --volume_gid_range=VALUE
+  </td>
+  <td>
+When this flag is specified, if a task running as non-root user uses a
+shared persistent volume or a PARENT type SANDBOX_PATH volume, the
+volume will be owned by a gid allocated from this range and have the
+`setgid` bit set, and the task process will be launched with the gid
+as its supplementary group to make sure it can access the volume.
+(Example: <code>[10000-20000]</code>)
   </td>
 </tr>
 </table>

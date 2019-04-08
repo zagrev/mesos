@@ -84,6 +84,13 @@
   jira_user: abudnik
   reviewboard_user: abudnik
 
+- name: Andrei Sekretenko
+  affiliations:
+    - {organization: Mesosphere}
+  emails:
+    - asekretenko@mesosphere.com
+  jira_user: asekretenko
+
 - name: Andrew Schwartzmeyer
   affiliations:
     - {organization: Microsoft}
@@ -258,12 +265,12 @@
   reviewboard_user: dpravat
 
 - name: DaoTan Cui
-   affiliations:
-    - {organization: Asiainfo}
-   emails:
-    - cuidt@outlook.com
-   jira_user: cuidt
-   reviewboard_user: dtcui
+  affiliations:
+   - {organization: Asiainfo}
+  emails:
+   - cuidt@outlook.com
+  jira_user: cuidt
+  reviewboard_user: dtcui
 
 - name: Dario Rexin
   affiliations:

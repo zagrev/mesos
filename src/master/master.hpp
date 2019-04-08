@@ -153,6 +153,14 @@ Slave(Master* const _master,
 
   void removeOperation(Operation* operation);
 
+  // Marks a non-speculative operation as an orphan when the originating
+  // framework is torn down by the master, or when an agent reregisters
+  // with operations from unknown frameworks. If the operation is
+  // non-terminal, this has the side effect of modifying the agent's
+  // total resources, and should therefore be followed by
+  // `allocator->updateSlave()`.
+  void markOperationAsOrphan(Operation* operation);
+
   Operation* getOperation(const UUID& uuid) const;
 
   void addOffer(Offer* offer);
@@ -247,6 +255,19 @@ Slave(Master* const _master,
   // Pending operations or terminal operations that have
   // unacknowledged status updates on this agent.
   hashmap<UUID, Operation*> operations;
+
+  // Pending operations whose originating framework is unknown.
+  // These operations could be pending, or terminal with unacknowledged
+  // status updates.
+  //
+  // This list can be populated whenever a framework is torn down in the
+  // lifetime of the master, or when an agent reregisters with an operation.
+  //
+  // If the originating framework is completed, the master will
+  // acknowledge any status updates instead of the framework.
+  // If an orphan does not belong to a completed framework, the master
+  // will only acknowledge status updates after a fixed delay.
+  hashset<UUID> orphanedOperations;
 
   // Active offers on this slave.
   hashset<Offer*> offers;
@@ -343,6 +364,11 @@ public:
          const Flags& flags = Flags());
 
   ~Master() override;
+
+  // Compare this master's capabilities with registry's minimum capability.
+  // Return the set of capabilities missing from this master.
+  static hashset<std::string> misingMinimumCapabilities(
+      const MasterInfo& masterInfo, const Registry& registry);
 
   // Message handlers.
   void submitScheduler(
@@ -660,12 +686,26 @@ protected:
       const std::string& message,
       Option<process::metrics::Counter> reason = None());
 
+  // Removes an agent from the master's state in the following cases:
+  // * When maintenance is started on an agent
+  // * When an agent registers with a new ID from a previously-known IP + port
+  // * When an agent unregisters itself with an `UnregisterSlaveMessage`
   void _removeSlave(
       Slave* slave,
       const process::Future<bool>& registrarResult,
       const std::string& removalCause,
       Option<process::metrics::Counter> reason = None());
 
+  // Removes an agent from the master's state in the following cases:
+  // * When marking an agent unreachable
+  // * When marking an agent gone
+  //
+  // NOTE that in spite of the name `__removeSlave()`, this function is NOT a
+  // continuation of `_removeSlave()`. Rather, these two functions perform
+  // similar logic for slightly different cases.
+  //
+  // TODO(greggomann): refactor `_removeSlave` and `__removeSlave` into a single
+  // common helper function. (See MESOS-9550)
   void __removeSlave(
       Slave* slave,
       const std::string& message,
@@ -1058,9 +1098,9 @@ private:
       Framework* framework,
       mesos::scheduler::Call::Reconcile&& reconcile);
 
-  mesos::scheduler::Response::ReconcileOperations reconcileOperations(
+  void reconcileOperations(
       Framework* framework,
-      const mesos::scheduler::Call::ReconcileOperations& reconcile);
+      mesos::scheduler::Call::ReconcileOperations&& reconcile);
 
   void message(
       Framework* framework,
@@ -1126,6 +1166,11 @@ private:
         const Option<process::http::authentication::Principal>&
             principal) const;
 
+    process::Future<process::http::Response> update(
+        const mesos::master::Call& call,
+        const Option<process::http::authentication::Principal>& principal)
+      const;
+
     process::Future<process::http::Response> set(
         const mesos::master::Call& call,
         const Option<process::http::authentication::Principal>&
@@ -1147,27 +1192,26 @@ private:
             principal) const;
 
   private:
-    // Heuristically tries to determine whether a quota request could
-    // reasonably be satisfied given the current cluster capacity. The
-    // goal is to determine whether a user may accidentally request an
-    // amount of resources that would prevent frameworks without quota
-    // from getting any offers. A force flag will allow users to bypass
-    // this check.
+    // Returns an error if the total quota guarantees overcommits
+    // the cluster. This is not a quota satisfiability check: it's
+    // possible that quota is unsatisfiable even if the quota
+    // does not overcommit the cluster.
+
+    // Returns an error if the total quota guarantees overcommits
+    // the cluster. This is not a quota satisfiability check: it's
+    // possible that quota is unsatisfiable even if the quota
+    // does not overcommit the cluster. Specifically, we verify that
+    // the following inequality holds:
     //
-    // The heuristic tests whether the total quota, including the new
-    // request, does not exceed the sum of non-static cluster resources,
-    // i.e. the following inequality holds:
-    //   total - statically reserved >= total quota + quota request
+    //    total cluster capacity >= total quota w/ quota request applied
     //
-    // Please be advised that:
-    //   * It is up to an allocator how to satisfy quota (for example,
-    //     what resources to account towards quota, as well as which
-    //     resources to consider allocatable for quota).
-    //   * Even if there are enough resources at the moment of this check,
-    //     agents may terminate at any time, rendering the cluster under
-    //     quota.
-    Option<Error> capacityHeuristic(
-        const mesos::quota::QuotaInfo& request) const;
+    // Note, total cluster capacity accounts resources of all the
+    // registered agents, including resources from resource providers
+    // as well as reservations (both static and dynamic ones).
+    static Option<Error> overcommitCheck(
+        const std::vector<Resources>& agents,
+        const hashmap<std::string, Quota>& quotas,
+        const mesos::quota::QuotaInfo& request);
 
     // We always want to rescind offers after the capacity heuristic. The
     // reason for this is the race between the allocator and the master:
@@ -1605,17 +1649,13 @@ private:
      *
      * @param slaveId The ID of the slave that the operation is
      *     updating.
-     * @param required The resources needed to satisfy the operation.
-     *     This is used for an optimization where we try to only
-     *     rescind offers that would contribute to satisfying the
-     *     operation.
      * @param operation The operation to be performed.
      *
-     * @return Returns 'OK' if successful, 'Conflict' otherwise.
+     * @return Returns 'OK' if successful, 'BadRequest' if the
+     *     operation is malformed, 'Conflict' otherwise.
      */
     process::Future<process::http::Response> _operation(
         const SlaveID& slaveId,
-        Resources required,
         const Offer::Operation& operation) const;
 
     // Master API handlers.

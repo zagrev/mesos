@@ -18,7 +18,7 @@
 # Process this file with autoconf to produce a configure script.
 
 AC_PREREQ([2.61])
-AC_INIT([mesos], [1.8.0])
+AC_INIT([mesos], [1.9.0])
 
 # Have autoconf setup some variables related to the system.
 AC_CANONICAL_HOST
@@ -280,6 +280,17 @@ AC_ARG_ENABLE([last_in_first_out_fixed_size_semaphore],
               AS_HELP_STRING([--enable-last-in-first-out-fixed-size-semaphore],
                              [enables the optimized LIFO fixed-size semaphore in libprocess]),
                              [], [enable_last_in_first_out_fixed_size_semaphore=no])
+
+AC_ARG_ENABLE([launcher_sealing],
+              AS_HELP_STRING([--enable-launcher-sealing],
+                             [Enables sealing of launcher binary during
+                              initialization of Mesos containerizer.
+                              A copy of launcher's binary is cloned into
+                              memory and sealed to prevent overwriting of
+                              launcher's executable by containers.
+                              This is a Linux-specific feature and requires
+                              the support of memfd by the kernel.]),
+                             [], [enable_launcher_sealing=no])
 
 AC_ARG_ENABLE([libevent],
               AS_HELP_STRING([--enable-libevent],
@@ -807,7 +818,6 @@ AM_CONDITIONAL([DISABLE_LIBTOOL_WRAPPERS],
 AM_CONDITIONAL([OS_LINUX], [test "x$OS_NAME" = "xlinux"])
 AM_CONDITIONAL([OS_FREEBSD], [test "x$OS_NAME" = "xfreebsd"])
 
-AM_CONDITIONAL([GIT_REPO], [test -d ${srcdir}"/.git"])
 AM_CONDITIONAL([HAS_GPERFTOOLS], [test "x$enable_perftools" = "xyes"])
 
 AM_CONDITIONAL([INSTALL_MODULE_DEPENDENCIES],
@@ -1483,6 +1493,26 @@ AM_CONDITIONAL([WITH_BUNDLED_LEVELDB],
                [test "x$with_bundled_leveldb" = "xyes"])
 
 
+# Check if we should use containerizer launcher sealing.
+AC_MSG_CHECKING([whether to enable launcher sealing])
+AC_MSG_RESULT([$enable_launcher_sealing])
+
+AS_IF([test "x$enable_launcher_sealing" = "xyes"], [
+  # We only support launcher sealing on Linux.
+  AS_IF([test "$OS_NAME" = "linux"],
+        [],
+        [AC_MSG_ERROR([no launcher sealing support on $OS_NAME
+-------------------------------------------------------------------
+Launcher sealing is only supported on Linux.
+-------------------------------------------------------------------
+  ])])
+
+  AC_DEFINE([ENABLE_LAUNCHER_SEALING])
+])
+
+AM_CONDITIONAL([ENABLE_LAUNCHER_SEALING], [test "x$enable_launcher_sealing" = "xyes"])
+
+
 # Check if libevent prefix path was provided, and if so, add it to
 # the CPPFLAGS and LDFLAGS with respective /include and /lib path
 # suffixes.
@@ -1775,6 +1805,12 @@ if test "x$without_bundled_protobuf" = "xyes" || \
                     [AC_MSG_ERROR([cannot find PROTOBUF_JAR=$PROTOBUF_JAR])])
     fi
 
+    AC_CHECK_FILE([$PROTOBUFPREFIX/include/google/protobuf/wrappers.proto],
+                  [],
+                  [AC_MSG_ERROR([cannot find protobuf proto files])])
+
+    PROTOBUF_PROTOCFLAGS="-I${PROTOBUFPREFIX}/include"
+
     AC_CHECK_TOOL([PROTOCOMPILER_TEST], [protoc], [], [$PROTOBUFPREFIX/bin])
 
     if test -z "`echo $PROTOCOMPILER_TEST`"; then
@@ -1786,7 +1822,6 @@ if test "x$without_bundled_protobuf" = "xyes" || \
     if test "x$enable_python" = "xyes"; then
       AC_PYTHON_MODULE([google.protobuf], [yes])
     fi
-
   else
     AC_MSG_ERROR([cannot find protobuf
 -------------------------------------------------------------------
@@ -1810,6 +1845,7 @@ AM_CONDITIONAL([WITH_BUNDLED_PROTOBUF],
 AC_SUBST([PROTOBUF_CPPFLAGS])
 AC_SUBST([PROTOBUF_JAR])
 AC_SUBST([PROTOBUF_LINKERFLAGS])
+AC_SUBST([PROTOBUF_PROTOCFLAGS])
 AC_SUBST([PROTOCOMPILER])
 
 
@@ -2783,6 +2819,64 @@ m4_define([major_minor_patch],
 AC_SUBST(MESOS_MAJOR_VERSION, m4_car(major_minor_patch))
 AC_SUBST(MESOS_MINOR_VERSION, m4_car(m4_shift(major_minor_patch)))
 AC_SUBST(MESOS_PATCH_VERSION, m4_car(m4_shift2(major_minor_patch)))
+
+
+###############################################################################
+# Configure libbuild definitions passed into 'src/common/git_version.hpp'.
+###############################################################################
+
+git_dir="${srcdir}/.git/"
+git_config=src/common/git_version.hpp
+
+# Create 'src/common/git_version.hpp' only if we did not do so before. This
+# protects the results from getting overwritten by additional configure runs
+# outside the reach of the git repository, as for example done by
+# 'support/packaging/centos/build_rpm.sh'.
+
+AC_MSG_CHECKING([${git_config} presence])
+
+AS_IF([test -f ${srcdir}/${git_config} || test -f ${git_config}], [AC_MSG_RESULT([yes])], [
+  AC_MSG_RESULT([no])
+
+  AC_MSG_NOTICE([generating ${git_config}])
+
+  # When building from a git clone, the definitions BUILD_GIT_SHA,
+  # BUILD_GIT_BRANCH, and BUILD_GIT_TAG will be emitted.
+
+  AS_IF([test -d ${git_dir}], [
+    # Optionally set BUILD_GIT_SHA.
+    DEFINE_BUILD_GIT_SHA=""
+
+    git_sha=$(git --git-dir=${git_dir} rev-parse HEAD 2>/dev/null)
+
+    AS_IF([test $? = 0], [
+      DEFINE_BUILD_GIT_SHA="#define BUILD_GIT_SHA \"${git_sha}\""
+    ])
+    AC_SUBST([DEFINE_BUILD_GIT_SHA])
+
+    # Optionally set BUILD_GIT_BRANCH.
+    DEFINE_BUILD_GIT_BRANCH=""
+
+    git_branch=$(git --git-dir=${git_dir} symbolic-ref HEAD 2>/dev/null)
+
+    AS_IF([test $? = 0], [
+      DEFINE_BUILD_GIT_BRANCH="#define BUILD_GIT_BRANCH \"${git_branch}\""
+    ])
+    AC_SUBST([DEFINE_BUILD_GIT_BRANCH])
+
+    # Optionally set BUILD_GIT_TAG.
+    DEFINE_BUILD_GIT_TAG=""
+
+    git_tag=$(git --git-dir=${git_dir} describe --exact --tags 2>/dev/null)
+
+    AS_IF([test $? = 0], [
+      DEFINE_BUILD_GIT_TAG="#define BUILD_GIT_TAG \"${git_tag}\""
+    ])
+    AC_SUBST([DEFINE_BUILD_GIT_TAG])
+  ])
+
+  AC_CONFIG_FILES([${git_config}])
+])
 
 
 AC_OUTPUT

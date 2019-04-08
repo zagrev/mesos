@@ -18,20 +18,16 @@
 #########################################
 include(MesosProtobuf)
 
-set(PUBLIC_PROTO_PATH "")
-set(PUBLIC_PROTOBUF_INCLUDE_DIR "")
 set(PUBLIC_PROTOBUF_SRC "")
-set(INTERNAL_PROTO_PATH "")
-set(INTERNAL_PROTOBUF_INCLUDE_DIR "")
 set(INTERNAL_PROTOBUF_SRC "")
 set(JAVA_PROTOBUF_SRC "")
 
 # Build the protobuf structs.
 #
 # NOTE: The following `PROTOC_GENERATE` calls will list append to
-# `PUBLIC_PROTO_PATH`, `PUBLIC_PROTOBUF_INCLUDE_DIR` and `PUBLIC_PROTOBUF_SRC`.
-# The GRPC option is a noop if gRPC is disabled.
-PROTOC_GENERATE(GRPC LIB csi TARGET csi)
+# `PUBLIC_PROTOBUF_SRC`. The GRPC option is a noop if gRPC is disabled.
+PROTOC_GENERATE(GRPC LIB csi_v0 TARGET csi/v0/csi)
+PROTOC_GENERATE(GRPC LIB csi_v1 TARGET csi/v1/csi)
 
 # NOTE: The following `PROTOC_GENERATE` calls will list append to
 # `PUBLIC_PROTOBUF_SRC`.
@@ -41,6 +37,7 @@ PROTOC_GENERATE(TARGET mesos/appc/spec)
 PROTOC_GENERATE(TARGET mesos/authentication/authentication)
 PROTOC_GENERATE(TARGET mesos/authorizer/acls)
 PROTOC_GENERATE(TARGET mesos/authorizer/authorizer)
+PROTOC_GENERATE(TARGET mesos/csi/types)
 PROTOC_GENERATE(TARGET mesos/docker/spec)
 PROTOC_GENERATE(TARGET mesos/docker/v1)
 PROTOC_GENERATE(TARGET mesos/docker/v2)
@@ -85,6 +82,7 @@ PROTOC_GENERATE(INTERNAL TARGET slave/containerizer/mesos/isolators/network/cni/
 PROTOC_GENERATE(INTERNAL TARGET slave/containerizer/mesos/isolators/docker/volume/state)
 PROTOC_GENERATE(INTERNAL TARGET slave/containerizer/mesos/provisioner/docker/message)
 PROTOC_GENERATE(INTERNAL TARGET slave/state)
+PROTOC_GENERATE(INTERNAL TARGET slave/volume_gid_manager/state)
 PROTOC_GENERATE(INTERNAL TARGET master/registry)
 PROTOC_GENERATE(INTERNAL TARGET resource_provider/registry)
 PROTOC_GENERATE(INTERNAL TARGET resource_provider/state)
@@ -117,11 +115,7 @@ target_link_libraries(mesos-protobufs PUBLIC
 target_include_directories(
   mesos-protobufs
   PUBLIC
-  ${MESOS_PROTOBUF_HEADER_INCLUDE_DIRS}
-  ${PUBLIC_PROTOBUF_INCLUDE_DIR}
-
-  PRIVATE
-  ${INTERNAL_PROTOBUF_INCLUDE_DIR})
+  ${MESOS_PROTOBUF_HEADER_INCLUDE_DIRS})
 
 
 # BUILD JAVA ARTIFACTS.
@@ -198,7 +192,8 @@ if (NOT WIN32)
     slave/containerizer/mesos/isolators/posix/disk.cpp
     slave/containerizer/mesos/isolators/posix/rlimits.cpp
     slave/containerizer/mesos/isolators/volume/sandbox_path.cpp
-    slave/containerizer/mesos/provisioner/utils.cpp)
+    slave/containerizer/mesos/provisioner/utils.cpp
+    slave/volume_gid_manager/volume_gid_manager.cpp)
 endif ()
 
 set(APPC_SRC
@@ -238,10 +233,17 @@ set(COMMON_SRC
   common/values.cpp)
 
 set(CSI_SRC
-  csi/client.cpp
+  csi/types.cpp
+  csi/metrics.cpp
   csi/paths.cpp
-  csi/rpc.cpp
-  csi/utils.cpp)
+  csi/service_manager.cpp
+  csi/v0.cpp
+  csi/v0_client.cpp
+  csi/v0_utils.cpp
+  csi/v0_volume_manager.cpp
+  csi/v1.cpp
+  csi/v1_client.cpp
+  csi/volume_manager.cpp)
 
 set(DOCKER_SRC
   docker/docker.cpp
@@ -307,6 +309,7 @@ set(LINUX_SRC
   slave/containerizer/mesos/isolators/volume/host_path.cpp
   slave/containerizer/mesos/isolators/volume/image.cpp
   slave/containerizer/mesos/isolators/volume/secret.cpp
+  slave/containerizer/mesos/isolators/volume/utils.cpp
   slave/containerizer/mesos/provisioner/backends/aufs.cpp
   slave/containerizer/mesos/provisioner/backends/bind.cpp
   slave/containerizer/mesos/provisioner/backends/overlay.cpp)
@@ -315,6 +318,11 @@ if (ENABLE_XFS_DISK_ISOLATOR)
   list(APPEND LINUX_SRC
     slave/containerizer/mesos/isolators/xfs/disk.cpp
     slave/containerizer/mesos/isolators/xfs/utils.cpp)
+endif ()
+
+if (ENABLE_LAUNCHER_SEALING)
+  list(APPEND LINUX_SRC
+    linux/memfd.cpp)
 endif ()
 
 if (ENABLE_LINUX_ROUTING)
@@ -568,6 +576,7 @@ target_compile_definitions(
   mesos PUBLIC
   USE_CMAKE_BUILD_CONFIG
   $<$<BOOL:${ENABLE_XFS_DISK_ISOLATOR}>:ENABLE_XFS_DISK_ISOLATOR>
+  $<$<BOOL:${ENABLE_LAUNCHER_SEALING}>:ENABLE_LAUNCHER_SEALING>
   $<$<BOOL:${ENABLE_PORT_MAPPING_ISOLATOR}>:ENABLE_PORT_MAPPING_ISOLATOR>
   $<$<BOOL:${ENABLE_NETWORK_PORTS_ISOLATOR}>:ENABLE_NETWORK_PORTS_ISOLATOR>
   $<$<BOOL:${ENABLE_SECCOMP_ISOLATOR}>:ENABLE_SECCOMP_ISOLATOR>)

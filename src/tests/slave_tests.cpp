@@ -158,7 +158,7 @@ namespace tests {
 // that seem vaguely more slave than master-related are in this file.
 // The others are in "master_tests.cpp".
 
-class SlaveTest : public MesosTest
+class SlaveTest : public ContainerizerTest<slave::MesosContainerizer>
 {
 public:
   const std::string defaultIsolators{
@@ -6549,6 +6549,7 @@ TEST_F(SlaveTest, UpdateOperationStatusRetry)
 
   AWAIT_READY(updateOperationStatusMessage);
   ASSERT_EQ(updateOperationStatusMessage->operation_uuid(), operationUuid);
+  EXPECT_TRUE(metricEquals("master/operations/finished", 1));
 
   Clock::resume();
 }
@@ -10935,6 +10936,9 @@ TEST_F(SlaveTest, RemoveResourceProvider)
   EXPECT_TRUE(updateOperationStatus->status().has_agent_id());
   EXPECT_FALSE(updateOperationStatus->status().has_resource_provider_id());
 
+  // The associated metrics should have also been increased.
+  EXPECT_TRUE(metricEquals("master/operations/gone_by_operator", 1));
+
   // The agent should also report a change to its resources.
   AWAIT_READY(updateSlaveMessage);
 
@@ -11521,6 +11525,7 @@ TEST_F(SlaveTest, RetryOperationStatusUpdateAfterRecovery)
 
   EXPECT_EQ(operationId, update->status().operation_id());
   EXPECT_EQ(v1::OPERATION_FINISHED, update->status().state());
+  EXPECT_TRUE(metricEquals("master/operations/finished", 1));
 
   // Restart the agent.
   slave.get()->terminate();

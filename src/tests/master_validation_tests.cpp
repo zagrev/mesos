@@ -55,6 +55,7 @@
 
 using namespace mesos::internal::master::validation;
 
+using google::protobuf::Map;
 using google::protobuf::RepeatedPtrField;
 
 using mesos::internal::master::Master;
@@ -70,6 +71,7 @@ using process::Message;
 using process::Owned;
 using process::PID;
 
+using std::pair;
 using std::string;
 using std::vector;
 
@@ -100,229 +102,84 @@ TEST(MasterCallValidationTest, UpdateQuota)
   error = master::validation::master::call::validate(updateQuota);
   EXPECT_NONE(error);
 
-  // Test validation at the request level.
-  mesos::quota::QuotaRequest request;
+  // Test validation at the config level.
+  mesos::quota::QuotaConfig config;
 
-  error = mesos::internal::master::quota::validate(request);
+  error = mesos::internal::master::quota::validate(config);
   ASSERT_SOME(error);
-  EXPECT_TRUE(strings::contains(
-      error->message,
-      "'QuotaRequest.role' must be set"))
+  EXPECT_TRUE(
+      strings::contains(error->message, "'QuotaConfig.role' must be set"))
     << error->message;
 
-  request.set_role("");
+  config.set_role("");
 
-  error = mesos::internal::master::quota::validate(request);
+  error = mesos::internal::master::quota::validate(config);
   ASSERT_SOME(error);
-  EXPECT_TRUE(strings::contains(
-      error->message,
-      "Invalid 'QuotaRequest.role'"))
+  EXPECT_TRUE(strings::contains(error->message, "Invalid 'QuotaConfig.role'"))
     << error->message;
 
-  request.set_role("*");
+  config.set_role("*");
 
-  error = mesos::internal::master::quota::validate(request);
+  error = mesos::internal::master::quota::validate(config);
   ASSERT_SOME(error);
   EXPECT_TRUE(strings::contains(
       error->message,
-      "Invalid 'QuotaRequest.role':"
+      "Invalid 'QuotaConfig.role':"
       " setting quota for the default '*' role is not supported"))
     << error->message;
 
   // Once a role is set, it is valid to have no guarantee and no limit.
-  request.set_role("role");
+  config.set_role("role");
 
-  error = mesos::internal::master::quota::validate(request);
+  error = mesos::internal::master::quota::validate(config);
   ASSERT_NONE(error);
 
-  auto validateGuaranteeOrLimit = [](
-      const string& fieldName,
-      RepeatedPtrField<Resource>* (mesos::quota::QuotaRequest::*field)()) {
-    Option<Error> error;
-    mesos::quota::QuotaRequest request;
-    request.set_role("role");
+  // Now test the guarantees <= limits validation.
 
-    // Ensure 'Resource.name' must be set.
-    Resource empty;
-    (request.*field)()->Clear();
-    (request.*field)()->Add()->CopyFrom(empty);
+  auto resourceMap = [](const vector<pair<string, double>>& vector)
+    -> Map<string, Value::Scalar> {
+    Map<string, Value::Scalar> result;
 
-    error = mesos::internal::master::quota::validate(request);
-    ASSERT_SOME(error);
-    EXPECT_TRUE(strings::contains(
-        error->message,
-        "Invalid 'QuotaRequest." + fieldName + "':"
-        " Resource ':0' is invalid: Empty resource name"))
-      << error->message;
+    foreachpair (const string& name, double value, vector) {
+      Value::Scalar scalar;
+      scalar.set_value(value);
+      result[name] = scalar;
+    }
 
-    // Ensure 'Resource.reservation' cannot be set.
-    Resource reservation;
-    reservation.set_name("disk");
-    reservation.set_type(Value::SCALAR);
-    reservation.mutable_scalar()->set_value(1.0);
-    reservation.mutable_reservation()->set_role("role");
-    (request.*field)()->Clear();
-    (request.*field)()->Add()->CopyFrom(reservation);
-
-    error = mesos::internal::master::quota::validate(request);
-    ASSERT_SOME(error);
-    EXPECT_TRUE(strings::contains(
-        error->message,
-        "Invalid 'QuotaRequest." + fieldName + "':"
-        " 'Resource.reservation' must not be set"))
-      << error->message;
-
-    // Ensure 'Resource.reservations' cannot be set.
-    Resource reservations =
-      CHECK_NOTERROR(Resources::parse("cpus", "1.0", "role"));
-    (request.*field)()->Clear();
-    (request.*field)()->Add()->CopyFrom(reservations);
-
-    error = mesos::internal::master::quota::validate(request);
-    ASSERT_SOME(error);
-    EXPECT_TRUE(strings::contains(
-        error->message,
-        "Invalid 'QuotaRequest." + fieldName + "':"
-        " 'Resource.reservations' must not be set"))
-      << error->message;
-
-    // Ensure 'Resource.disk' cannot be set.
-    Resource disk = CHECK_NOTERROR(Resources::parse("disk", "1.0", "*"));
-    disk.mutable_disk();
-    (request.*field)()->Clear();
-    (request.*field)()->Add()->CopyFrom(disk);
-
-    error = mesos::internal::master::quota::validate(request);
-    ASSERT_SOME(error);
-    EXPECT_TRUE(strings::contains(
-        error->message,
-        "Invalid 'QuotaRequest." + fieldName + "':"
-        " 'Resource.disk' must not be set"))
-      << error->message;
-
-    // Ensure 'Resource.revocable' cannot be set.
-    Resource revocable = CHECK_NOTERROR(Resources::parse("cpus", "1.0", "*"));
-    revocable.mutable_revocable();
-    (request.*field)()->Clear();
-    (request.*field)()->Add()->CopyFrom(revocable);
-
-    error = mesos::internal::master::quota::validate(request);
-    ASSERT_SOME(error);
-    EXPECT_TRUE(strings::contains(
-        error->message,
-        "Invalid 'QuotaRequest." + fieldName + "':"
-        " 'Resource.revocable' must not be set"))
-      << error->message;
-
-    // Ensure non-SCALAR types are disallowed.
-    Resource ports;
-    ports.set_name("ports");
-    ports.set_type(Value::RANGES);
-    ports.mutable_ranges();
-    (request.*field)()->Clear();
-    (request.*field)()->Add()->CopyFrom(ports);
-
-    error = mesos::internal::master::quota::validate(request);
-    ASSERT_SOME(error);
-    EXPECT_TRUE(strings::contains(
-        error->message,
-        "Invalid 'QuotaRequest." + fieldName + "':"
-        " 'Resource.type' must be 'SCALAR'"))
-      << error->message;
-
-    // Ensure 'Resource.shared' cannot be set.
-    Resource shared;
-    shared.set_name("disk");
-    shared.set_type(Value::SCALAR);
-    shared.mutable_scalar()->set_value(1.0);
-    shared.mutable_shared();
-    (request.*field)()->Clear();
-    (request.*field)()->Add()->CopyFrom(shared);
-
-    error = mesos::internal::master::quota::validate(request);
-    ASSERT_SOME(error);
-    EXPECT_TRUE(strings::contains(
-        error->message,
-        "Invalid 'QuotaRequest." + fieldName + "':"
-        " 'Resource.shared' must not be set"))
-      << error->message;
-
-    // Ensure 'Resource.provider_id' cannot be set.
-    Resource withProvider;
-    withProvider.set_name("disk");
-    withProvider.set_type(Value::SCALAR);
-    withProvider.mutable_scalar()->set_value(1.0);
-    withProvider.mutable_provider_id()->set_value("ID");
-    (request.*field)()->Clear();
-    (request.*field)()->Add()->CopyFrom(withProvider);
-
-    error = mesos::internal::master::quota::validate(request);
-    ASSERT_SOME(error);
-    EXPECT_TRUE(strings::contains(
-        error->message,
-        "Invalid 'QuotaRequest." + fieldName + "':"
-        " 'Resource.provider_id' must not be set"))
-      << error->message;
-
-    // Ensure only a single entry for each resource name.
-    Resource cpu = CHECK_NOTERROR(Resources::parse("cpus", "1.0", "*"));
-    (request.*field)()->Clear();
-    (request.*field)()->Add()->CopyFrom(cpu);
-    (request.*field)()->Add()->CopyFrom(cpu);
-
-    error = mesos::internal::master::quota::validate(request);
-    ASSERT_SOME(error);
-    EXPECT_TRUE(strings::contains(
-        error->message,
-        "Invalid 'QuotaRequest." + fieldName + "':"
-        " Duplicate 'cpus'; only a single entry"
-        " for each resource is supported"))
-      << error->message;
+    return result;
   };
 
-  validateGuaranteeOrLimit(
-      "guarantee",
-      &mesos::quota::QuotaRequest::mutable_guarantee);
+  // Guarantees > limits.
+  Map<string, Value::Scalar> superset =
+    resourceMap({{"cpus", 20}, {"mem", 40}});
+  Map<string, Value::Scalar> subset = resourceMap({{"cpus", 10}, {"mem", 20}});
 
-  validateGuaranteeOrLimit(
-      "limit",
-      &mesos::quota::QuotaRequest::mutable_limit);
+  *config.mutable_guarantees() = superset;
+  *config.mutable_limits() = subset;
 
-  // Now test the guarantee <= limit validation.
-  // No guarantee and no limit.
-  error = mesos::internal::master::quota::validate(request);
-  EXPECT_NONE(error);
-
-  // Guarantee > limit.
-  Resources subset = CHECK_NOTERROR(Resources::parse("cpus:10;mem:20"));
-  Resources superset = CHECK_NOTERROR(Resources::parse("cpus:20;mem:40"));
-
-  request.mutable_guarantee()->CopyFrom(superset);
-  request.mutable_limit()->CopyFrom(subset);
-
-  error = mesos::internal::master::quota::validate(request);
+  error = mesos::internal::master::quota::validate(config);
   ASSERT_SOME(error);
   EXPECT_TRUE(strings::contains(
       error->message,
-      "'QuotaRequest.guarantee' (cpus:20; mem:40)"
-      " is not contained within the 'QuotaRequest.limit' (cpus:10; mem:20)"))
+      "'QuotaConfig.guarantees' { cpus: 20, mem: 40 } is not"
+      " contained within the 'QuotaConfig.limits' { cpus: 10, mem: 20 }"))
     << error->message;
 
-  // Guarantee = limit.
-  request.mutable_guarantee()->CopyFrom(subset);
-  request.mutable_limit()->CopyFrom(subset);
+  // Guarantees = limits.
+  *config.mutable_guarantees() = subset;
+  *config.mutable_limits() = subset;
 
-  error = mesos::internal::master::quota::validate(request);
+  error = mesos::internal::master::quota::validate(config);
   EXPECT_NONE(error);
 
-  // Guarantee < limit.
-  request.mutable_guarantee()->CopyFrom(subset);
-  request.mutable_limit()->CopyFrom(superset);
+  // Guarantees < limits.
+  *config.mutable_guarantees() = subset;
+  *config.mutable_limits() = superset;
 
-  error = mesos::internal::master::quota::validate(request);
+  error = mesos::internal::master::quota::validate(config);
   EXPECT_NONE(error);
 
-  // Now we ensure that the guarantee <= limit check is a
+  // Now we ensure that the guarantees <= limits check is a
   // per-resource check. This is important because it's ok to:
   //
   //   (1) Set a limit for a resource when there is no guarantee
@@ -333,15 +190,15 @@ TEST(MasterCallValidationTest, UpdateQuota)
   //
   // We test both cases at once by having both guarantee and
   // limit contain a resource not specified in the other.
-  Resources cpuMemWithDisk =
-    CHECK_NOTERROR(Resources::parse("cpus:10;mem:20;disk:10"));
-  Resources cpuMemWithGpu =
-    CHECK_NOTERROR(Resources::parse("cpus:10;mem:20;gpu:1"));
+  Map<string, Value::Scalar> cpuMemWithDisk =
+    resourceMap({{"cpus", 10}, {"mem", 20}, {"disk", 10}});
+  Map<string, Value::Scalar> cpuMemWithGpu =
+    resourceMap({{"cpus", 10}, {"mem", 20}, {"gpu", 1}});
 
-  request.mutable_guarantee()->CopyFrom(cpuMemWithDisk);
-  request.mutable_limit()->CopyFrom(cpuMemWithGpu);
+  *config.mutable_guarantees() = cpuMemWithDisk;
+  *config.mutable_limits() = cpuMemWithGpu;
 
-  error = mesos::internal::master::quota::validate(request);
+  error = mesos::internal::master::quota::validate(config);
   EXPECT_NONE(error);
 }
 
@@ -2117,20 +1974,37 @@ TEST(OperationValidationTest, CreateDisk)
 TEST(OperationValidationTest, DestroyDisk)
 {
   Resource disk1 = createDiskResource(
-      "10", "*", None(), None(), createDiskSourceMount());
+      "10", "*", None(), None(), createDiskSourceMount(None(), "volume1"));
 
   Resource disk2 = createDiskResource(
-      "20", "*", None(), None(), createDiskSourceBlock());
+      "20", "*", None(), None(), createDiskSourceBlock("volume2"));
 
   Resource disk3 = createDiskResource(
-      "30", "*", None(), None(), createDiskSourcePath());
+      "40", "*", None(), None(), createDiskSourceRaw("volume3"));
 
   Resource disk4 = createDiskResource(
-      "40", "*", None(), None(), createDiskSourceMount());
+      "40", "*", None(), None(), createDiskSourcePath("volume4"));
+
+  Resource disk5 = createDiskResource(
+      "50", "*", None(), None(), createDiskSourceMount(None(), "volume5"));
+
+  Resource disk6 = createDiskResource(
+      "60", "*", None(), None(), createDiskSourceRaw(None(), "profile"));
+
+  Resource disk7 = createPersistentVolume(
+      Megabytes(70),
+      "role",
+      "id",
+      "path",
+      None(),
+      createDiskSourceMount(None(), "volume7"));
 
   disk1.mutable_provider_id()->set_value("provider1");
   disk2.mutable_provider_id()->set_value("provider2");
   disk3.mutable_provider_id()->set_value("provider3");
+  disk4.mutable_provider_id()->set_value("provider4");
+  disk6.mutable_provider_id()->set_value("provider6");
+  disk7.mutable_provider_id()->set_value("provider7");
 
   Offer::Operation::DestroyDisk destroyDisk;
   destroyDisk.mutable_source()->CopyFrom(disk1);
@@ -2146,10 +2020,7 @@ TEST(OperationValidationTest, DestroyDisk)
   destroyDisk.mutable_source()->CopyFrom(disk3);
 
   error = operation::validate(destroyDisk);
-  ASSERT_SOME(error);
-  EXPECT_TRUE(strings::contains(
-      error->message,
-      "'source' is neither a MOUNT or BLOCK disk resource"));
+  EXPECT_NONE(error);
 
   destroyDisk.mutable_source()->CopyFrom(disk4);
 
@@ -2157,7 +2028,31 @@ TEST(OperationValidationTest, DestroyDisk)
   ASSERT_SOME(error);
   EXPECT_TRUE(strings::contains(
       error->message,
+      "'source' is neither a MOUNT, BLOCK or RAW disk resource"));
+
+  destroyDisk.mutable_source()->CopyFrom(disk5);
+
+  error = operation::validate(destroyDisk);
+  ASSERT_SOME(error);
+  EXPECT_TRUE(strings::contains(
+      error->message,
       "'source' is not managed by a resource provider"));
+
+  destroyDisk.mutable_source()->CopyFrom(disk6);
+
+  error = operation::validate(destroyDisk);
+  ASSERT_SOME(error);
+  EXPECT_TRUE(strings::contains(
+      error->message,
+      "'source' is not backed by a CSI volume"));
+
+  destroyDisk.mutable_source()->CopyFrom(disk7);
+
+  error = operation::validate(destroyDisk);
+  ASSERT_SOME(error);
+  EXPECT_TRUE(strings::contains(
+      error->message,
+      "Please destroy the persistent volume first"));
 }
 
 
@@ -3362,6 +3257,57 @@ TEST_F(TaskValidationTest, TaskMissingDockerInfo)
   driver.join();
 }
 
+// This test verifies that a task that has `ContainerInfo` set as MESOS
+// but has a `DockerInfo` is rejected during `TaskInfo` validation.
+TEST_F(TaskValidationTest, TaskMesosTypeWithDockerInfo)
+{
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get());
+  ASSERT_SOME(slave);
+
+  MockScheduler sched;
+  MesosSchedulerDriver driver(
+      &sched, DEFAULT_FRAMEWORK_INFO, master.get()->pid, DEFAULT_CREDENTIAL);
+
+  EXPECT_CALL(sched, registered(&driver, _, _));
+
+  Future<vector<Offer>> offers;
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  driver.start();
+
+  AWAIT_READY(offers);
+  ASSERT_FALSE(offers->empty());
+
+  Future<TaskStatus> status;
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&status));
+
+  // Create an invalid task that has `ContainerInfo` set
+  // as MESOS and has a `DockerInfo` set.
+  TaskInfo task = createTask(offers.get()[0], "exit 0");
+  task.mutable_container()->set_type(ContainerInfo::MESOS);
+  task.mutable_container()->mutable_docker()->set_image("alpine");
+
+  driver.launchTasks(offers.get()[0].id(), {task});
+
+  AWAIT_READY(status);
+  EXPECT_EQ(TASK_ERROR, status->state());
+  EXPECT_EQ(
+    "Task's `ContainerInfo` is invalid: "
+    "Protobuf union `mesos.ContainerInfo` with `Type == MESOS` "
+    "should not have the field `docker` set.",
+    status->message());
+
+  driver.stop();
+  driver.join();
+}
+
 
 // This test verifies that a task that has `name` parameter set
 // in `DockerInfo` is rejected during `TaskInfo` validation.
@@ -3519,6 +3465,21 @@ TEST_F(ExecutorValidationTest, ExecutorType)
         error->message,
         "'ExecutorInfo.container.mesos.image' must not be set for "
         "'DEFAULT' executor"));
+  }
+  {
+    // Invalid protobuf union in ContainerInfo.
+    executorInfo.set_type(ExecutorInfo::CUSTOM);
+    executorInfo.mutable_command();
+    executorInfo.mutable_container()->set_type(ContainerInfo::DOCKER);
+    executorInfo.mutable_container()->mutable_mesos();
+
+    Option<Error> error = ::executor::internal::validateType(executorInfo);
+
+    EXPECT_SOME(error);
+    EXPECT_TRUE(strings::contains(
+      error->message,
+      "Protobuf union `mesos.ContainerInfo` with `Type == DOCKER` "
+      "should not have the field `mesos` set."));
   }
 }
 
@@ -4703,6 +4664,33 @@ TEST_F(FrameworkInfoValidationTest, ValidateFrameworkID)
 
   frameworkInfo.mutable_id()->set_value("foo/..");
   EXPECT_SOME(::framework::validate(frameworkInfo));
+}
+
+
+// This test validates that framework cannot configure negative
+// resources in their minimal allocatable resources offer filters.
+TEST_F(FrameworkInfoValidationTest, ValidateOfferFilters)
+{
+  Value::Scalar scalar;
+  scalar.set_value(-2);
+
+  OfferFilters offerFilters;
+  offerFilters.mutable_min_allocatable_resources()
+    ->add_quantities()
+    ->mutable_quantities()
+    ->insert({"cpus", scalar});
+
+  FrameworkInfo frameworkInfo = DEFAULT_FRAMEWORK_INFO;
+
+  ASSERT_FALSE(frameworkInfo.roles().empty());
+
+  frameworkInfo.mutable_offer_filters()->insert(
+      {frameworkInfo.roles(0), offerFilters});
+
+  EXPECT_SOME_EQ(
+      Error("Invalid resource quantity for 'cpus': "
+        "Negative values not supported"),
+      framework::validate(frameworkInfo));
 }
 
 

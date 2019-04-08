@@ -330,6 +330,15 @@ mesos::internal::slave::Flags::Flags()
       "NOTE: This feature is not yet supported on Windows agent, and\n"
       "therefore the flag currently does not exist on that platform.",
       true);
+
+  add(&Flags::volume_gid_range,
+      "volume_gid_range",
+      "When this flag is specified, if a task running as non-root user uses a\n"
+      "shared persistent volume or a PARENT type SANDBOX_PATH volume, the\n"
+      "volume will be owned by a gid allocated from this range and have the\n"
+      "`setgid` bit set, and the task process will be launched with the gid\n"
+      "as its supplementary group to make sure it can access the volume.\n"
+      "(Example: `[10000-20000]`)");
 #endif // __WINDOWS__
 
   add(&Flags::http_heartbeat_interval,
@@ -650,6 +659,12 @@ mesos::internal::slave::Flags::Flags()
       "no cgroup limits are set, they are inherited from the root mesos\n"
       "cgroup.");
 
+  add(&Flags::host_path_volume_force_creation,
+      "host_path_volume_force_creation",
+      "A colon-separated list of directories where descendant directories\n"
+      "are allowed to be created by the `volume/host_path` isolator,\n"
+      "if the directories do not exist.");
+
   add(&Flags::nvidia_gpu_devices,
       "nvidia_gpu_devices",
       "A comma-separated list of Nvidia GPU devices. When `gpus` is\n"
@@ -755,14 +770,16 @@ mesos::internal::slave::Flags::Flags()
   add(&Flags::agent_features,
       "agent_features",
       "JSON representation of agent features to whitelist. We always require\n"
-      "'MULTI_ROLE', 'HIERARCHICAL_ROLE', and 'RESERVATION_REFINEMENT'.\n"
+      "'MULTI_ROLE', 'HIERARCHICAL_ROLE', 'RESERVATION_REFINEMENT', and\n"
+      "'AGENT_OPERATION_FEEDBACK'.\n"
       "\n"
       "Example:\n"
       "{\n"
       "    \"capabilities\": [\n"
       "        {\"type\": \"MULTI_ROLE\"},\n"
       "        {\"type\": \"HIERARCHICAL_ROLE\"},\n"
-      "        {\"type\": \"RESERVATION_REFINEMENT\"}\n"
+      "        {\"type\": \"RESERVATION_REFINEMENT\"},\n"
+      "        {\"type\": \"AGENT_OPERATION_FEEDBACK\"}\n"
       "    ]\n"
       "}\n",
       [](const Option<SlaveCapabilities>& agentFeatures) -> Option<Error> {
@@ -773,10 +790,12 @@ mesos::internal::slave::Flags::Flags()
 
           if (!capabilities.multiRole ||
               !capabilities.hierarchicalRole ||
-              !capabilities.reservationRefinement) {
+              !capabilities.reservationRefinement ||
+              !capabilities.agentOperationFeedback) {
             return Error(
-                "At least the following agent features need to be enabled: "
-                "MULTI_ROLE, HIERARCHICAL_ROLE, RESERVATION_REFINEMENT");
+                "At least the following agent features need to be enabled:"
+                " MULTI_ROLE, HIERARCHICAL_ROLE, RESERVATION_REFINEMENT,"
+                " AGENT_OPERATION_FEEDBACK");
           }
 
           if (capabilities.resizeVolume && !capabilities.resourceProvider) {

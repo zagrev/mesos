@@ -28,12 +28,10 @@
 # (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-# Modified by Adam B (adam@mesosphere.io) to handle hpp files.
-# Modified by Avinash S (avinash@mesosphere.io) to check for at least
-# a __single__ space in comments is required for hpp and cpp files.
-# Modified by Tomek J (janiszt@gmail.com) to check for NULL usage.
-# Modified by Armand G (agrillet@mesosphere.io) to skip file when linted
-# and to not print anything if there is no error.
+# This file was modified for use in Mesos from the upstream revision
+# `43d512ba130` from https://github.com/google/styleguide.git. To
+# review the currently made changes please perform a diff against the
+# specific upstream version.
 
 """Does google-lint on c++ files.
 
@@ -47,7 +45,6 @@ In particular, we can get very confused by /* and // inside strings!
 We do a small hack, which is to ignore //'s with "'s after them on the
 same line, but it is far from perfect (in either direction).
 """
-# pylint: skip-file
 
 import codecs
 import copy
@@ -242,7 +239,6 @@ _ERROR_CATEGORIES = [
     'build/include_order',
     'build/include_what_you_use',
     'build/namespaces',
-    'build/nullptr',
     'build/printf_format',
     'build/storage_class',
     'legal/copyright',
@@ -585,7 +581,7 @@ _line_length = 80
 
 # The allowed extensions for file names
 # This is set by --extensions flag.
-_valid_extensions = set(['cc', 'h', 'cpp', 'cu', 'cuh', 'hpp'])
+_valid_extensions = set(['cc', 'h', 'cpp', 'cu', 'cuh'])
 
 # Treat all headers starting with 'h' equally: .h, .hpp, .hxx etc.
 # This is set by --headers flag.
@@ -4324,7 +4320,7 @@ def GetLineWidth(line):
           is_low_surrogate = 0xDC00 <= ord(uc) <= 0xDFFF
           if not is_wide_build and is_low_surrogate:
             width -= 1
-
+          
         width += 1
     return width
   else:
@@ -4432,10 +4428,6 @@ def CheckStyle(filename, clean_lines, linenum, file_extension, nesting_state,
            cleansed_line.find('break;') != -1)):
     error(filename, linenum, 'whitespace/newline', 0,
           'More than one command on the same line')
-
-  if re.search(r'\bNULL\b', cleansed_line):
-    error(filename, linenum, 'build/nullptr', 1,
-          'NULL found; better to use nullptr')
 
   # Some more style checks
   CheckBraces(filename, clean_lines, linenum, error)

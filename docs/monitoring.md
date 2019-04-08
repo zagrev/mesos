@@ -657,6 +657,67 @@ The task states listed here match those of the task state machine.
 </tr>
 </table>
 
+#### Operations
+
+The following metrics provide information about offer operations on the master.
+
+Below, `OPERATION_TYPE` refers to any one of `reserve`, `unreserve`, `create`,
+`destroy`, `grow_volume`, `shrink_volume`, `create_disk` or `destroy_disk`.
+
+NOTE: The counter for terminal operation states can over-count over time. In
+particular if an agent contained unacknowledged terminal status updates when
+it was marked gone or marked unreachable, these operations will be double-counted
+as both their original state and `OPERATION_GONE`/`OPERATION_UNREACHABLE`.
+
+<table class="table table-striped">
+<thead>
+<tr><th>Metric</th><th>Description</th><th>Type</th>
+</thead>
+<tr>
+  <td>
+  <code>master/operations/total</code>
+  </td>
+  <td>Total number of operations known to this master</td>
+  <td>Gauge</td>
+</tr>
+<tr>
+  <td>
+  <code>master/operations/&lt;OPERATION_STATE&gt;</code>
+  </td>
+  <td>Number of operations in the given non-terminal state (`pending`, `recovering` or `unreachable`)</td>
+  <td>Gauge</td>
+</tr>
+<tr>
+  <td>
+  <code>master/operations/&lt;OPERATION_STATE&gt;</code>
+  </td>
+  <td>Number of operations in the given terminal state (`finished`, `error`, `dropped` or `gone_by_operator`)</td>
+  <td>Counter</td>
+</tr>
+
+<tr>
+  <td>
+  <code>master/operations/&lt;OPERATION_TYPE&gt;/total</code>
+  </td>
+  <td>Total number of operations with the given type known to this master</td>
+  <td>Gauge</td>
+</tr>
+<tr>
+  <td>
+  <code>master/operations/&lt;OPERATION_TYPE&gt;/&lt;OPERATION_STATE&gt;</code>
+  </td>
+  <td>Number of operations with the given type in the given non-terminal state (`pending`, `recovering` or `unreachable`)</td>
+  <td>Gauge</td>
+</tr>
+<tr>
+  <td>
+  <code>master/operations/&lt;OPERATION_TYPE&gt;/&lt;OPERATION_STATE&gt;</code>
+  </td>
+  <td>Number of operations with the given type in the given state (`finished`, `error`, `dropped` or `gone_by_operator`)</td>
+  <td>Counter</td>
+</tr>
+</table>
+
 #### Messages
 
 The following metrics provide information about messages between the master and
@@ -1601,6 +1662,20 @@ the agent and their current usage.
   <td>Allocated revocable memory in MB</td>
   <td>Gauge</td>
 </tr>
+<tr>
+  <td>
+  <code>volume_gid_manager/volume_gids_total</code>
+  </td>
+  <td>Number of gids configured for volume gid manager</td>
+  <td>Gauge</td>
+</tr>
+<tr>
+  <td>
+  <code>volume_gid_manager/volume_gids_free</code>
+  </td>
+  <td>Number of free gids available for volume gid manager</td>
+  <td>Gauge</td>
+</tr>
 </table>
 
 #### Agent
@@ -2145,9 +2220,7 @@ Storage resource providers in Mesos are backed by
 [standalone containers](standalone-container.md). To monitor the health of these
 CSI plugins for a storage resource provider with _type_ and _name_, the
 following metrics provide information about plugin terminations and ongoing and
-completed CSI calls made to the plugin. In the following metrics, the _rpc_
-placeholder refers to the name of a particular CSI call, which is described in
-the list of [supported CSI calls](#supported-csi-calls).
+completed CSI calls made to the plugin.
 
 <table class="table table-striped">
 <thead>
@@ -2162,60 +2235,30 @@ the list of [supported CSI calls](#supported-csi-calls).
 </tr>
 <tr>
   <td>
-  <code>resource_providers/<i>&lt;type&gt;</i>.<i>&lt;name&gt;</i>/csi_plugin/rpcs/<i>&lt;rpc&gt;</i>/pending</code>
+  <code>resource_providers/<i>&lt;type&gt;</i>.<i>&lt;name&gt;</i>/csi_plugin/rpcs_pending</code>
   </td>
-  <td>Number of ongoing <i>rpc</i> calls</td>
+  <td>Number of ongoing CSI calls</td>
   <td>Gauge</td>
 </tr>
 <tr>
   <td>
-  <code>resource_providers/<i>&lt;type&gt;</i>.<i>&lt;name&gt;</i>/csi_plugin/rpcs/<i>&lt;rpc&gt;</i>/successes</code>
+  <code>resource_providers/<i>&lt;type&gt;</i>.<i>&lt;name&gt;</i>/csi_plugin/rpcs_finished</code>
   </td>
-  <td>Number of successful <i>rpc</i> calls</td>
+  <td>Number of successful CSI calls</td>
   <td>Counter</td>
 </tr>
 <tr>
   <td>
-  <code>resource_providers/<i>&lt;type&gt;</i>.<i>&lt;name&gt;</i>/csi_plugin/rpcs/<i>&lt;rpc&gt;</i>/errors</code>
+  <code>resource_providers/<i>&lt;type&gt;</i>.<i>&lt;name&gt;</i>/csi_plugin/rpcs_failed</code>
   </td>
-  <td>Number of erroneous <i>rpc</i> calls</td>
+  <td>Number of failed CSI calls</td>
   <td>Counter</td>
 </tr>
 <tr>
   <td>
-  <code>resource_providers/<i>&lt;type&gt;</i>.<i>&lt;name&gt;</i>/csi_plugin/rpcs/<i>&lt;rpc&gt;</i>/cancelled</code>
+  <code>resource_providers/<i>&lt;type&gt;</i>.<i>&lt;name&gt;</i>/csi_plugin/rpcs_cancelled</code>
   </td>
-  <td>Number of cancelled <i>rpc</i> calls</td>
+  <td>Number of cancelled CSI calls</td>
   <td>Counter</td>
 </tr>
 </table>
-
-##### Supported CSI Calls
-
-The following is a comprehensive list of CSI calls that are used in storage
-resource providers. These names are used to replace the _rpc_ placeholder in the
-above metrics.
-
-* [`csi.v0.Identity.GetPluginInfo`](https://github.com/container-storage-interface/spec/blob/v0.2.0/spec.md#getplugininfo)
-* [`csi.v0.Identity.GetPluginCapabilities`](https://github.com/container-storage-interface/spec/blob/v0.2.0/spec.md#getplugincapabilities)
-* [`csi.v0.Identity.Probe`](https://github.com/container-storage-interface/spec/blob/v0.2.0/spec.md#probe)
-* [`csi.v0.Controller.CreateVolume`](https://github.com/container-storage-interface/spec/blob/v0.2.0/spec.md#createvolume)
-* [`csi.v0.Controller.DeleteVolume`](https://github.com/container-storage-interface/spec/blob/v0.2.0/spec.md#deletevolume)
-* [`csi.v0.Controller.ControllerPublishVolume`](https://github.com/container-storage-interface/spec/blob/v0.2.0/spec.md#controllerpublishvolume)
-* [`csi.v0.Controller.ControllerUnpublishVolume`](https://github.com/container-storage-interface/spec/blob/v0.2.0/spec.md#controllerunpublishvolume)
-* [`csi.v0.Controller.ValidateVolumeCapabilities`](https://github.com/container-storage-interface/spec/blob/v0.2.0/spec.md#validatevolumecapabilities)
-* [`csi.v0.Controller.ListVolumes`](https://github.com/container-storage-interface/spec/blob/v0.2.0/spec.md#listvolumes)
-* [`csi.v0.Controller.GetCapacity`](https://github.com/container-storage-interface/spec/blob/v0.2.0/spec.md#getcapacity)
-* [`csi.v0.Controller.ControllerGetCapabilities`](https://github.com/container-storage-interface/spec/blob/v0.2.0/spec.md#controllergetcapabilities)
-* [`csi.v0.Node.NodeStageVolume`](https://github.com/container-storage-interface/spec/blob/v0.2.0/spec.md#node-service-rpc)
-* [`csi.v0.Node.NodeUnstageVolume`](https://github.com/container-storage-interface/spec/blob/v0.2.0/spec.md#nodeunstagevolume)
-* [`csi.v0.Node.NodePublishVolume`](https://github.com/container-storage-interface/spec/blob/v0.2.0/spec.md#nodepublishvolume)
-* [`csi.v0.Node.NodeUnpublishVolume`](https://github.com/container-storage-interface/spec/blob/v0.2.0/spec.md#nodeunpublishvolume)
-* [`csi.v0.Node.NodeGetId`](https://github.com/container-storage-interface/spec/blob/v0.2.0/spec.md#nodegetid)
-* [`csi.v0.Node.NodeGetCapabilities`](https://github.com/container-storage-interface/spec/blob/v0.2.0/spec.md#nodegetcapabilities)
-
-For example, cluster operators can monitor the number of successful
-`csi.v0.Controller.CreateVolume` calls that are made by the resource provider
-with type `org.apache.mesos.rp.local.storage` and name `lvm` through the
-`resource_providers/org.apache.mesos.rp.local.storage.lvm/csi_plugin/rpcs/csi.v0.Controller.CreateVolume/successes`
-metric.

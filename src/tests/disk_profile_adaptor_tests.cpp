@@ -19,6 +19,9 @@
 #include <tuple>
 #include <vector>
 
+#include <mesos/csi/types.hpp>
+#include <mesos/csi/v0.hpp>
+
 #include <mesos/module/disk_profile_adaptor.hpp>
 
 #include <mesos/resource_provider/storage/disk_profile_adaptor.hpp>
@@ -483,7 +486,7 @@ TEST_F(UriDiskProfileAdaptorTest, FetchFromFile)
   AWAIT_ASSERT_READY(mapping);
   ASSERT_TRUE(mapping->capability.has_block());
   ASSERT_EQ(
-      csi::v0::VolumeCapability::AccessMode::MULTI_NODE_SINGLE_WRITER,
+      csi::types::VolumeCapability::AccessMode::MULTI_NODE_SINGLE_WRITER,
       mapping->capability.access_mode().mode());
 
   Clock::resume();

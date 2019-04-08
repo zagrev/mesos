@@ -2284,6 +2284,121 @@ TEST_F(HierarchicalAllocatorTest, Allocatable)
 }
 
 
+// Check that if a framework specifies minimum allocatable resources, it
+// correctly overrides the global minimum. We check this by ensuring it gets an
+// offer when the global minimum is not satisfied but the framework's
+// role-specific minimum is. This test also confirms that framework minimal
+// allocatable resources can be updated in the allocator by checking that the
+// framework gets no offers with the default flags and only specify a limit
+// later on.
+TEST_F(HierarchicalAllocatorTest, FrameworkMinAllocatable)
+{
+  // Pausing the clock is not necessary, but ensures that the test
+  // doesn't rely on the batch allocation in the allocator, which
+  // would slow down the test.
+  Clock::pause();
+
+  master::Flags flags = master::Flags();
+  flags.min_allocatable_resources = "cpus:0.01|mem:32";
+
+  initialize(flags);
+
+  // Initially start the framework without any non-standard static
+  // offer filters.
+  FrameworkInfo framework = createFrameworkInfo({"role1"});
+  allocator->addFramework(framework.id(), framework, {}, true, {});
+
+  // Not enough memory or cpu to be considered allocatable with
+  // default minimum allocatable resources.
+  SlaveInfo slave = createSlaveInfo(
+      "cpus:" + stringify(0.01 / 2) + ";"
+      "mem:" + stringify(32. / 2) + ";"
+      "disk:128");
+  allocator->addSlave(
+      slave.id(),
+      slave,
+      AGENT_CAPABILITIES(),
+      None(),
+      slave.resources(),
+      {});
+
+  // The framework should not get offers as no resources allocatable
+  // to it are available.
+  Future<Allocation> allocation = allocations.get();
+
+  Clock::settle();
+  ASSERT_TRUE(allocation.isPending());
+
+  // Update the framework with custom minimal allocatable resources
+  // below the globally configured minimal allocatable resources and
+  // statisfiable by the available resources.
+  Value::Scalar minCpus;
+  minCpus.set_value(0.01 / 3);
+
+  framework.mutable_offer_filters()->insert({framework.roles(0), {}});
+  framework.mutable_offer_filters()
+    ->at(framework.roles(0))
+    .mutable_min_allocatable_resources()
+    ->add_quantities()
+    ->mutable_quantities()
+    ->insert({"cpus", minCpus});
+  allocator->updateFramework(framework.id(), framework, {});
+
+  // Advance the clock to trigger allocation of the available resources.
+  Clock::advance(flags.allocation_interval);
+
+  Allocation expected =
+    Allocation(framework.id(), {{"role1", {{slave.id(), slave.resources()}}}});
+
+  AWAIT_EXPECT_EQ(expected, allocation);
+}
+
+
+// Check that a framework-specified empty set of minimum allocatable resource
+// requirements is interpreted as the framework accepting any resources
+// regardless of the global limit.
+TEST_F(HierarchicalAllocatorTest, FrameworkEmptyMinAllocatable)
+{
+  // Pausing the clock is not necessary, but ensures that the test
+  // doesn't rely on the batch allocation in the allocator, which
+  // would slow down the test.
+  Clock::pause();
+
+  master::Flags flags = master::Flags();
+  flags.min_allocatable_resources = "cpus:0.01|mem:32";
+
+  initialize(flags);
+
+  // Add a framework which specifies minimum allocatable resources
+  // with an empty set of quantities.
+  FrameworkInfo framework = createFrameworkInfo({"role1"});
+  framework.mutable_offer_filters()->insert({framework.roles(0), {}});
+  framework.mutable_offer_filters()
+    ->at(framework.roles(0))
+    .mutable_min_allocatable_resources();
+  allocator->addFramework(framework.id(), framework, {}, true, {});
+
+  // Not enough memory or cpu to be considered allocatable with
+  // default minimum allocatable resources.
+  SlaveInfo slave = createSlaveInfo(
+      "cpus:" + stringify(0.01 / 2) + ";"
+      "mem:" + stringify(32. / 2) + ";"
+      "disk:128");
+  allocator->addSlave(
+      slave.id(),
+      slave,
+      AGENT_CAPABILITIES(),
+      None(),
+      slave.resources(),
+      {});
+
+  Allocation expected =
+    Allocation(framework.id(), {{"role1", {{slave.id(), slave.resources()}}}});
+
+  AWAIT_EXPECT_EQ(expected, allocations.get());
+}
+
+
 // This test ensures that frameworks can apply offer operations (e.g.,
 // creating persistent volumes) on their allocations.
 TEST_F(HierarchicalAllocatorTest, UpdateAllocation)
@@ -2918,6 +3033,134 @@ TEST_F(HierarchicalAllocatorTest, UpdateSlaveCapabilities)
       {{"role1", {{agent.id(), agent.resources()}}}});
 
   AWAIT_EXPECT_EQ(expected, allocation);
+}
+
+
+// This is a white-box test to ensure that MESOS-9554 is fixed.
+// It ensures that if a framework is not capable of receiving
+// any resources on an agent, we still proceed to try allocating
+// those resources to other frameworks (previously, the loop
+// exited incorrectly in this case). This is done through the
+// RESERVATION_REFINEMENT capability.
+TEST_F(HierarchicalAllocatorTest, FrameworkLoopMESOS_9554)
+{
+  // Pause clock to disable batch allocation.
+  Clock::pause();
+
+  initialize();
+
+  // First, we add a framework and agent and ensure the
+  // resources get allocated. This makes framework 1 have
+  // a non-zero share.
+  FrameworkInfo framework1 = createFrameworkInfo(
+      {"parent/child"},
+      {FrameworkInfo::Capability::RESERVATION_REFINEMENT});
+
+  allocator->addFramework(framework1.id(), framework1, {}, true, {});
+
+  SlaveInfo agent1 = createSlaveInfo("cpus:1;mem:1;disk:1");
+
+  allocator->addSlave(
+      agent1.id(),
+      agent1,
+      AGENT_CAPABILITIES(),
+      None(),
+      agent1.resources(),
+      {});
+
+  Allocation expected = Allocation(
+      framework1.id(),
+      {{"parent/child", {{agent1.id(), agent1.resources()}}}});
+
+  AWAIT_EXPECT_EQ(expected, allocations.get());
+
+  // Now, we add a framework that is not RESERVATION_REFINEMENT
+  // capable, it will have a lower share of 0 in the same role.
+  FrameworkInfo framework2 = createFrameworkInfo({"parent/child"});
+
+  // We explicitly check to ensure the RESERVATION_REFINEMENT
+  // capability is absent, in case the `createFrameworkInfo`
+  // helper changes in the future.
+  EXPECT_EQ(1, framework2.capabilities_size());
+  ASSERT_EQ(FrameworkInfo::Capability::MULTI_ROLE,
+            framework2.capabilities().begin()->type());
+
+  allocator->addFramework(framework2.id(), framework2, {}, true, {});
+
+  // There is nothing to be allocated.
+  Clock::settle();
+  Future<Allocation> allocation = allocations.get();
+  ASSERT_TRUE(allocation.isPending());
+
+  // Here's the meat of this test. We'll add a second agent with
+  // refined reservations. The lower share framework2 is not capable
+  // of being offered any resources on this agent, and they should
+  // be correctly sent to framework1 instead.
+  Resources resources =
+    CHECK_NOTERROR(Resources::parse("cpus:1;mem:1;disk:1"))
+      .pushReservation(createDynamicReservationInfo("parent"))
+      .pushReservation(createDynamicReservationInfo("parent/child"));
+
+  foreach (const Resource& r, resources) {
+    ASSERT_TRUE(Resources::hasRefinedReservations(r));
+  }
+
+  SlaveInfo agent2 = createSlaveInfo(resources);
+
+  allocator->addSlave(
+      agent2.id(),
+      agent2,
+      AGENT_CAPABILITIES(),
+      None(),
+      agent2.resources(),
+      {});
+
+  expected = Allocation(
+      framework1.id(),
+      {{"parent/child", {{agent2.id(), agent2.resources()}}}});
+
+  AWAIT_EXPECT_EQ(expected, allocation);
+}
+
+
+// This is a regression test for MESOS-9555 that ensures that
+// the tracking of non-scalar reservations across agents does
+// not lead to a CHECK failure.
+TEST_F(HierarchicalAllocatorTest, NonScalarReservationTrackingMESOS_9555)
+{
+  // Pause clock to disable batch allocation.
+  Clock::pause();
+
+  initialize();
+
+  // Have only non-scalar (ports) reserved for a role.
+  Resources resources = CHECK_NOTERROR(Resources::parse(
+      "cpus:1;mem:1;disk:1;ports(role):[1-2]"));
+
+  SlaveInfo agent1 = createSlaveInfo(resources);
+
+  allocator->addSlave(
+      agent1.id(),
+      agent1,
+      AGENT_CAPABILITIES(),
+      None(),
+      agent1.resources(),
+      {});
+
+  SlaveInfo agent2 = createSlaveInfo(resources);
+
+  allocator->addSlave(
+      agent2.id(),
+      agent2,
+      AGENT_CAPABILITIES(),
+      None(),
+      agent2.resources(),
+      {});
+
+  allocator->removeSlave(agent1.id());
+  allocator->removeSlave(agent2.id());
+
+  Clock::settle();
 }
 
 
@@ -3699,6 +3942,55 @@ TEST_F(HierarchicalAllocatorTest, QuotaAllocationGranularityUnchoppableResource)
   // Quota: "cpus:2;mem:2048;disk:150".
   // Allocated quota: "cpus:2;mem:2048;disk:150",
   // out of the 150 disk resource, 100 is MOUNT type, 50 is default type.
+}
+
+
+// This test ensures that quota is satisfied in the presence of multiple
+// unreserved disk resources. This is a regression test for MESOS-9692.
+TEST_F(HierarchicalAllocatorTest, QuotaAllocationMultipleDisk)
+{
+  // The test sets a quota that contains 100 disk resources and
+  // an agent with two kinds of disk resources: 50 vanilla disks
+  // and 50 mount disks. Both disks (100 in total) should be offered
+  // to the framework in a single offer to meet its role's quota.
+
+  Clock::pause();
+  initialize();
+
+  const string QUOTA_ROLE{"quota-role"};
+
+  const Quota quota = createQuota(QUOTA_ROLE, "cpus:1;mem:512;disk:100");
+  allocator->setQuota(QUOTA_ROLE, quota);
+
+  // Create 50 disk resource of type `MOUNT`.
+  Resources mountDiskResource = createDiskResource(
+      "50", "*", None(), None(), createDiskSourceMount(), false);
+
+  Resources agentResources =
+    Resources::parse("cpus:1;mem:512;disk:50").get() + mountDiskResource;
+
+  SlaveInfo agent1 = createSlaveInfo(agentResources);
+  allocator->addSlave(
+      agent1.id(),
+      agent1,
+      AGENT_CAPABILITIES(),
+      None(),
+      agent1.resources(),
+      {});
+
+  // Create `framework` under `QUOTA_ROLE`.
+  // This will tigger an event-driven allocation loop.
+  FrameworkInfo framework = createFrameworkInfo({QUOTA_ROLE});
+  allocator->addFramework(framework.id(), framework, {}, true, {});
+
+  Clock::settle();
+
+  // `framework` will get all resources (including both disks) of `agent1` to
+  // satisfy its role's quota.
+  Allocation expected = Allocation(
+      framework.id(), {{QUOTA_ROLE, {{agent1.id(), agent1.resources()}}}});
+
+  AWAIT_EXPECT_EQ(expected, allocations.get());
 }
 
 
@@ -5826,9 +6118,255 @@ TEST_F(HierarchicalAllocatorTest, QuotaWithAncestorReservations)
 }
 
 
+// This test verifies that a subrole's reservation is counted towards
+// parent's consumed quota. See MESOS-9688.
+TEST_F(HierarchicalAllocatorTest, QuotaWithNestedRoleReservation)
+{
+  // Setup:
+  //   Roles: "a"   --> guarantee cpus:2;mem:200
+  //          "a/b" --> reservation cpus:1;mem:100
+  //
+  // Test:
+  //   Add a second agent with cpus:10;mem:1000
+  //   Expect "a" to be allocated cpus:1;mem:100 to reach
+  //     its guarantee (since it already has a consumption of
+  //     cpus:1;mem:100 from the "a/b" reservation).
+
+  // -------
+  // Setup
+  // -------
+
+  Clock::pause();
+
+  initialize();
+
+  const string PARENT_ROLE{"a"};
+  const string CHILD_ROLE{"a/b"};
+
+  Quota quota = createQuota(PARENT_ROLE, "cpus:2;mem:200");
+  allocator->setQuota(PARENT_ROLE, quota);
+
+  // This agent is reserved for the child role "a/b".
+  SlaveInfo agent1 = createSlaveInfo("cpus(a/b):1;mem(a/b):100");
+  allocator->addSlave(
+      agent1.id(),
+      agent1,
+      AGENT_CAPABILITIES(),
+      None(),
+      agent1.resources(),
+      {});
+
+  // -------
+  // Test
+  // -------
+
+  SlaveInfo agent2 = createSlaveInfo("cpus:10;mem:1000");
+  allocator->addSlave(
+      agent2.id(),
+      agent2,
+      AGENT_CAPABILITIES(),
+      None(),
+      agent2.resources(),
+      {});
+
+  // Add framework1 under the parent role "a".
+  FrameworkInfo framework1 = createFrameworkInfo({PARENT_ROLE});
+  allocator->addFramework(framework1.id(), framework1, {}, true, {});
+
+  // Process all events.
+  Clock::settle();
+
+  Allocation expected = Allocation(
+      framework1.id(),
+      {{
+          PARENT_ROLE,
+          {{agent2.id(), *Resources::fromSimpleString("cpus:1;mem:100")}}
+      }});
+
+  AWAIT_EXPECT_EQ(expected, allocations.get());
+}
+
+// This test ensures that nested role's allocation is accounted
+// to top-level role's consumed quota.
+TEST_F(HierarchicalAllocatorTest, QuotaWithNestedRoleAllocation)
+{
+  // Setup:
+  // agent1: R
+  // Roles:
+  //     "a"   --> guarantee with R w/ no framework
+  //     "a/b" --> has `framework1`, allocated R on agent1
+  //
+  // Test:
+  //   Add `framework2` under "a"
+  //   Add agent2 with R
+  // Ensure:
+  //   `agent2` is allocated to `framework1` under `a/b`, even though, role
+  // `a` and `framework2` have lower shares. This is because role `a` has
+  // reached its quota limit (due to its subrole's allocation). Also,
+  // currently, subrole's allocations are not constrained by top-level
+  // role's quota (though they are tracked post factum).
+  //
+  // TODO(mzhu): Once we finish support for hierarchical quota, no allocation
+  // should be made since "a/b" will also be bound by the quota of "a".
+
+  // --- SET UP ---
+
+  Clock::pause();
+
+  initialize();
+
+  const string PARENT_ROLE{"a"};
+  const string CHILD_ROLE{"a/b"};
+
+  // Add framework1 under the child role "a/b".
+  FrameworkInfo framework1 = createFrameworkInfo({CHILD_ROLE});
+  allocator->addFramework(framework1.id(), framework1, {}, true, {});
+
+  SlaveInfo agent1 = createSlaveInfo("cpus:1;mem:1024");
+  allocator->addSlave(
+      agent1.id(),
+      agent1,
+      AGENT_CAPABILITIES(),
+      None(),
+      agent1.resources(),
+      {});
+
+  Allocation expected = Allocation(
+      framework1.id(), {{CHILD_ROLE, {{agent1.id(), agent1.resources()}}}});
+
+  AWAIT_EXPECT_EQ(expected, allocations.get());
+
+  Quota quota = createQuota(PARENT_ROLE, "cpus:1;mem:1024");
+  allocator->setQuota(PARENT_ROLE, quota);
+
+  // --- TEST ---
+
+  // Add framework2 under the parent role "a".
+  FrameworkInfo framework2 = createFrameworkInfo({PARENT_ROLE});
+  allocator->addFramework(framework2.id(), framework2, {}, true, {});
+
+  SlaveInfo agent2 = createSlaveInfo("cpus:1;mem:1024");
+  allocator->addSlave(
+      agent2.id(),
+      agent2,
+      AGENT_CAPABILITIES(),
+      None(),
+      agent2.resources(),
+      {});
+
+  // Process all events.
+  Clock::settle();
+
+  expected = Allocation(
+      framework1.id(), {{CHILD_ROLE, {{agent2.id(), agent2.resources()}}}});
+
+  AWAIT_EXPECT_EQ(expected, allocations.get());
+}
+
+
+// This test ensures that quota headroom is calculated correctly
+// in the presence of subrole's allocations.
+TEST_F(HierarchicalAllocatorTest, QuotaHeadroomWithNestedRoleAllocation)
+{
+  // Setup:
+  //   agents: 2 * R
+  //    roles: "a"   --> allocated R
+  //           "a/b" --> allocated R
+  //           "quota-role" --> guarantee R w/ no framework
+  //
+  // Test: Add 1 more agent with R.
+  //       Ensure agent is held back for "quota-role".
+  //       Add 1 more agent with R.
+  //       Ensure only 1 of the two extra agents goes to "a" or "a/b"
+  //         (since there is enough headroom for "quota-role")
+
+  Clock::pause();
+
+  initialize();
+
+  const string PARENT_ROLE = "a";
+  const string CHILD_ROLE = "a/b";
+
+  // Add framework1 under the parent role "a/b".
+  FrameworkInfo framework1 = createFrameworkInfo({CHILD_ROLE});
+  allocator->addFramework(framework1.id(), framework1, {}, true, {});
+
+  SlaveInfo agent1 = createSlaveInfo("cpus:1;mem:100");
+  allocator->addSlave(
+      agent1.id(),
+      agent1,
+      AGENT_CAPABILITIES(),
+      None(),
+      agent1.resources(),
+      {});
+
+  // All the resources of agent1 are offered to framework1.
+  Allocation expected = Allocation(
+      framework1.id(), {{CHILD_ROLE, {{agent1.id(), agent1.resources()}}}});
+
+  AWAIT_EXPECT_EQ(expected, allocations.get());
+
+  // Add framework2 under the child role "a".
+  FrameworkInfo framework2 = createFrameworkInfo({PARENT_ROLE});
+  allocator->addFramework(framework2.id(), framework2, {}, true, {});
+
+  // Add `agent2` which will be allocated to `framework2`.
+  SlaveInfo agent2 = createSlaveInfo("cpus:1;mem:100");
+  allocator->addSlave(
+      agent2.id(),
+      agent2,
+      AGENT_CAPABILITIES(),
+      None(),
+      agent2.resources(),
+      {});
+
+  // All the resources of agent2 are offered to framework2.
+  expected = Allocation(
+      framework2.id(), {{PARENT_ROLE, {{agent2.id(), agent2.resources()}}}});
+
+  AWAIT_EXPECT_EQ(expected, allocations.get());
+
+  const string QUOTA_ROLE{"quota-role"};
+
+  Quota quota = createQuota(QUOTA_ROLE, "cpus:1;mem:100");
+  allocator->setQuota(QUOTA_ROLE, quota);
+
+  SlaveInfo agent3 = createSlaveInfo("cpus:1;mem:100");
+  allocator->addSlave(
+      agent3.id(),
+      agent3,
+      AGENT_CAPABILITIES(),
+      None(),
+      agent3.resources(),
+      {});
+
+  Future<Allocation> allocation = allocations.get();
+  EXPECT_TRUE(allocation.isPending());
+
+  SlaveInfo agent4 = createSlaveInfo("cpus:1;mem:100");
+  allocator->addSlave(
+      agent4.id(),
+      agent4,
+      AGENT_CAPABILITIES(),
+      None(),
+      agent4.resources(),
+      {});
+
+  Clock::settle();
+
+  // There should be one allocation made. Either agent3 or agent4 is
+  // allocated and the other agent is set aside for the quota headroom.
+  AWAIT_READY(allocation);
+  EXPECT_TRUE(allocations.get().isPending());
+}
+
+
 // This test checks that quota guarantees work as expected when a
 // nested role is created as a child of an existing quota'd role.
-TEST_F(HierarchicalAllocatorTest, NestedRoleQuota)
+//
+// TODO(bmahler): Re-enable this test once hierarchical quota is
+// implemented.
+TEST_F(HierarchicalAllocatorTest, DISABLED_NestedRoleQuota)
 {
   // Pausing the clock is not necessary, but ensures that the test
   // doesn't rely on the batch allocation in the allocator, which
@@ -5917,7 +6455,10 @@ TEST_F(HierarchicalAllocatorTest, NestedRoleQuota)
 // This test checks that quota guarantees work as expected when a
 // nested role is created as a child of an existing quota'd role, and
 // the parent role has been allocated resources.
-TEST_F(HierarchicalAllocatorTest, NestedRoleQuotaAllocateToParent)
+//
+// TODO(bmahler): Re-enable this test once hierarchical quota is
+// implemented.
+TEST_F(HierarchicalAllocatorTest, DISABLED_NestedRoleQuotaAllocateToParent)
 {
   // Pausing the clock is not necessary, but ensures that the test
   // doesn't rely on the batch allocation in the allocator, which

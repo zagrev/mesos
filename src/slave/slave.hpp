@@ -22,6 +22,7 @@
 #include <list>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <mesos/attributes.hpp>
@@ -127,6 +128,7 @@ public:
         mesos::slave::ResourceEstimator* resourceEstimator,
         mesos::slave::QoSController* qosController,
         mesos::SecretGenerator* secretGenerator,
+        VolumeGidManager* volumeGidManager,
         const Option<Authorizer*>& authorizer);
 
   ~Slave() override;
@@ -546,6 +548,13 @@ public:
   // executors. Otherwise, the slave attempts to shutdown/kill them.
   process::Future<Nothing> _recover();
 
+  // This is a helper to call `recover()` on the volume gid manager.
+  process::Future<Nothing> _recoverVolumeGidManager(bool rebooted);
+
+  // This is a helper to call `recover()` on the task status update manager.
+  process::Future<Option<state::SlaveState>> _recoverTaskStatusUpdates(
+      const Option<state::SlaveState>& slaveState);
+
   // This is a helper to call `recover()` on the containerizer at the end of
   // `recover()` and before `__recover()`.
   // TODO(idownes): Remove this when we support defers to objects.
@@ -555,7 +564,7 @@ public:
   // This is called after `_recoverContainerizer()`. It will add all
   // checkpointed operations affecting agent default resources and call
   // `OperationStatusUpdateManager::recover()`.
-  process::Future<OperationStatusUpdateManagerState> _recoverOperations(
+  process::Future<Nothing> _recoverOperations(
       const Option<state::SlaveState>& state);
 
   // This is called after `OperationStatusUpdateManager::recover()`
@@ -687,13 +696,9 @@ private:
 
   void apply(Operation* operation);
 
-  // Publish all resources that are needed to run the current set of
-  // tasks and executors on the agent.
-  // NOTE: The `additionalResources` parameter is for publishing
-  // additional task resources when launching executors. Consider
-  // removing this parameter once we revisited MESOS-600.
+  // Prepare all resources to be consumed by the specified container.
   process::Future<Nothing> publishResources(
-      const Option<Resources>& additionalResources = None());
+      const ContainerID& containerId, const Resources& resources);
 
   // PullGauge methods.
   double _frameworks_active()
@@ -835,6 +840,8 @@ private:
 
   mesos::SecretGenerator* secretGenerator;
 
+  VolumeGidManager* volumeGidManager;
+
   const Option<Authorizer*> authorizer;
 
   // The most recent estimate of the total amount of oversubscribed
@@ -865,6 +872,11 @@ private:
   // either agent default resources or resources offered by a resource
   // provider.
   hashmap<UUID, Operation*> operations;
+
+  // Maps framework-supplied operation IDs to the operation's internal UUID.
+  // This is used to satisfy some reconciliation requests which are forwarded
+  // from the master to the agent.
+  hashmap<std::pair<FrameworkID, OperationID>, UUID> operationIds;
 
   // Operations that are checkpointed by the agent.
   hashmap<UUID, Operation> checkpointedOperations;

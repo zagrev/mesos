@@ -124,9 +124,9 @@ private:
       const Image& image,
       const string& backend);
 
-  Future<vector<string>> moveLayers(
+  Future<Image> moveLayers(
       const string& staging,
-      const vector<string>& layerIds,
+      const Image& image,
       const string& backend);
 
   Future<Nothing> moveLayer(
@@ -326,6 +326,13 @@ Future<Image> StoreProcess::_get(
       }
     }
 
+    if (image->has_config_digest() &&
+        !os::exists(paths::getImageLayerPath(
+            flags.docker_store_dir,
+            image->config_digest()))) {
+      layerMissed = true;
+    }
+
     if (!layerMissed) {
       return image.get();
     }
@@ -356,8 +363,8 @@ Future<Image> StoreProcess::_get(
                   staging.get(),
                   lambda::_1,
                   backend))
-      .then(defer(self(), [=](const vector<string>& layerIds) {
-        return metadataManager->put(reference, layerIds);
+      .then(defer(self(), [=](const Image& image) {
+        return metadataManager->put(image);
       }))
       .onAny(defer(self(), [=](const Future<Image>&) {
         pulling.erase(name);
@@ -393,16 +400,25 @@ Future<ImageInfo> StoreProcess::__get(
         backend));
   }
 
-  const string path = paths::getImageLayerManifestPath(
-      flags.docker_store_dir,
-      image.layer_ids(image.layer_ids_size() - 1));
+  string configPath;
+  if (image.has_config_digest()) {
+    // Optional 'config_digest' will only be set for docker manifest
+    // V2 Schema2 case.
+    configPath = paths::getImageLayerPath(
+        flags.docker_store_dir,
+        image.config_digest());
+  } else {
+    // Read the manifest from the last layer because all runtime config
+    // are merged at the leaf already.
+    configPath = paths::getImageLayerManifestPath(
+        flags.docker_store_dir,
+        image.layer_ids(image.layer_ids_size() - 1));
+  }
 
-  // Read the manifest from the last layer because all runtime config
-  // are merged at the leaf already.
-  Try<string> manifest = os::read(path);
+  Try<string> manifest = os::read(configPath);
   if (manifest.isError()) {
     return Failure(
-        "Failed to read manifest from '" + path + "': " +
+        "Failed to read manifest from '" + configPath + "': " +
         manifest.error());
   }
 
@@ -411,7 +427,7 @@ Future<ImageInfo> StoreProcess::__get(
 
   if (v1.isError()) {
     return Failure(
-        "Failed to parse docker v1 manifest from '" + path + "': " +
+        "Failed to parse docker v1 manifest from '" + configPath + "': " +
         v1.error());
   }
 
@@ -419,18 +435,36 @@ Future<ImageInfo> StoreProcess::__get(
 }
 
 
-Future<vector<string>> StoreProcess::moveLayers(
+Future<Image> StoreProcess::moveLayers(
     const string& staging,
-    const vector<string>& layerIds,
+    const Image& image,
     const string& backend)
 {
   vector<Future<Nothing>> futures;
-  foreach (const string& layerId, layerIds) {
+  foreach (const string& layerId, image.layer_ids()) {
     futures.push_back(moveLayer(staging, layerId, backend));
   }
 
   return collect(futures)
-    .then([layerIds]() -> vector<string> { return layerIds; });
+    .then(defer(self(), [=]() -> Future<Image> {
+      if (image.has_config_digest()) {
+        const string configSource = path::join(staging, image.config_digest());
+        const string configTarget = paths::getImageLayerPath(
+            flags.docker_store_dir,
+            image.config_digest());
+
+        if (!os::exists(configTarget)) {
+          Try<Nothing> rename = os::rename(configSource, configTarget);
+          if (rename.isError()) {
+            return Failure(
+                "Failed to move image manifest config from '" + configSource +
+                "' to '" + configTarget + "': " + rename.error());
+          }
+        }
+      }
+
+      return image;
+    }));
 }
 
 

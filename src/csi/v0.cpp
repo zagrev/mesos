@@ -14,23 +14,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef __CSI_SPEC_HPP__
-#define __CSI_SPEC_HPP__
+#include <mesos/csi/v0.hpp>
 
-// ONLY USEFUL AFTER RUNNING PROTOC.
-#include <csi/csi.pb.h>
+using std::ostream;
 
-// ONLY USEFUL AFTER RUNNING PROTOC WITH GRPC CPP PLUGIN.
-#include <csi/csi.grpc.pb.h>
-
-namespace mesos {
 namespace csi {
 namespace v0 {
 
-using namespace ::csi::v0;
+ostream& operator<<(
+    ostream& stream,
+    const ControllerServiceCapability::RPC::Type& type)
+{
+  return stream << ControllerServiceCapability::RPC::Type_Name(type);
+}
 
 } // namespace v0 {
 } // namespace csi {
-} // namespace mesos {
-
-#endif // __CSI_SPEC_HPP__

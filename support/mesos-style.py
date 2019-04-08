@@ -246,7 +246,6 @@ class CppLinter(LinterBase):
                     r'glog\-0\.3\.3|' \
                     r'boost\-1\.53\.0|' \
                     r'libev\-4\.15|' \
-                    r'java/jni|' \
                     r'\.pb\.cc|\.pb\.h|\.md|\.virtualenv' \
                     ')'
 
@@ -266,7 +265,6 @@ class CppLinter(LinterBase):
             'build/class',
             'build/deprecated',
             'build/endif_comment',
-            'build/nullptr',
             'readability/todo',
             'readability/namespace',
             'runtime/vlog',
@@ -288,7 +286,7 @@ class CppLinter(LinterBase):
         # We do not use a version of cpplint available through pip as
         # we use a custom version (see cpplint.path) to lint C++ files.
         process = subprocess.Popen(
-            [sys.executable, 'support/cpplint.py',
+            [sys.executable, 'support/cpplint.py', '--extensions=hpp,cpp',
              rules_filter] + source_paths,
             stderr=subprocess.PIPE,
             close_fds=True)
@@ -373,7 +371,6 @@ class PyLinter(LinterBase):
                     r'glog\-0\.3\.3|' \
                     r'boost\-1\.53\.0|' \
                     r'libev\-4\.15|' \
-                    r'java/jni|' \
                     r'\.virtualenv|' \
                     r'\.tox' \
                     ')'

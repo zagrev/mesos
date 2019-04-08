@@ -78,6 +78,7 @@ endif ()
 set(MESOS_TESTS_SRC
   ${MESOS_TESTS_UTILS_SRC}
   agent_container_api_tests.cpp
+  agent_operation_feedback_tests.cpp
   anonymous_tests.cpp
   api_tests.cpp
   attributes_tests.cpp
@@ -90,6 +91,7 @@ set(MESOS_TESTS_SRC
   cram_md5_authentication_tests.cpp
   credentials_tests.cpp
   csi_client_tests.cpp
+  csi_utils_tests.cpp
   default_executor_tests.cpp
   exception_tests.cpp
   executor_http_api_tests.cpp
@@ -104,6 +106,7 @@ set(MESOS_TESTS_SRC
   hook_tests.cpp
   http_authentication_tests.cpp
   http_fault_tolerance_tests.cpp
+  master_load_tests.cpp
   master_maintenance_tests.cpp
   master_slave_reconciliation_tests.cpp
   operation_reconciliation_tests.cpp
@@ -190,7 +193,8 @@ if (NOT WIN32)
     reservation_tests.cpp
     state_tests.cpp
     teardown_tests.cpp
-    upgrade_tests.cpp)
+    upgrade_tests.cpp
+    volume_gid_manager_tests.cpp)
 
   list(APPEND MESOS_TESTS_SRC
     common/command_utils_tests.cpp)
@@ -248,6 +252,11 @@ if (LINUX)
     list(APPEND MESOS_TESTS_SRC
       containerizer/linux_seccomp_parser_tests.cpp
       containerizer/linux_seccomp_isolator_tests.cpp)
+  endif()
+
+  if (ENABLE_LAUNCHER_SEALING)
+    list(APPEND MESOS_TESTS_SRC
+      containerizer/linux_memfd_tests.cpp)
   endif()
 
   if (ENABLE_LINUX_ROUTING)
@@ -349,6 +358,7 @@ if (NOT WIN32)
     load-generator-framework
     long-lived-executor
     long-lived-framework
+    operation-feedback-framework
     no-executor-framework
     persistent-volume-framework
     test-executor

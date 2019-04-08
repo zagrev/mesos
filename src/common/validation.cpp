@@ -20,6 +20,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 
 #include <mesos/executor/executor.hpp>
 
@@ -30,6 +31,8 @@
 #include <stout/unreachable.hpp>
 
 #include <stout/os/constants.hpp>
+
+#include "common/protobuf_utils.hpp"
 
 using std::string;
 
@@ -263,6 +266,11 @@ Option<Error> validateVolume(const Volume& volume)
 
 Option<Error> validateContainerInfo(const ContainerInfo& containerInfo)
 {
+  Option<Error> unionError = protobuf::validateProtobufUnion(containerInfo);
+  if (unionError.isSome()) {
+    return unionError;
+  }
+
   foreach (const Volume& volume, containerInfo.volumes()) {
     Option<Error> error = validateVolume(volume);
     if (error.isSome()) {
@@ -612,6 +620,56 @@ Option<Error> validateExecutorCall(const mesos::executor::Call& call)
   }
 
   UNREACHABLE();
+}
+
+
+Option<Error> validateOfferFilters(const OfferFilters& offerFilters)
+{
+  if (offerFilters.has_min_allocatable_resources()) {
+    foreach (
+        const OfferFilters::ResourceQuantities& quantities,
+        offerFilters.min_allocatable_resources().quantities()) {
+      if (quantities.quantities().empty()) {
+        return Error("Resource quantities must contain at least one quantity");
+      }
+
+      // Use `auto` instead of `protobuf::MapPair<string, Value::>` since
+      // `foreach` is a macro and does not allow angle brackets.
+      foreach (auto&& quantity, quantities.quantities()) {
+        Option<Error> error = validateInputScalarValue(quantity.second.value());
+        if (error.isSome()) {
+          return Error(
+              "Invalid resource quantity for '" + quantity.first + "': " +
+              error->message);
+        }
+      }
+    }
+  }
+
+  return None();
+}
+
+Option<Error> validateInputScalarValue(double value)
+{
+  switch (std::fpclassify(value)) {
+    case FP_INFINITE:
+      return Error("Infinite values not supported");
+    case FP_NAN:
+      return Error("NaN not supported");
+    case FP_SUBNORMAL:
+      return Error("Subnormal values not supported");
+    case FP_ZERO:
+      break;
+    case FP_NORMAL:
+      if (value < 0) {
+        return Error("Negative values not supported");
+      }
+      break;
+    default:
+      return Error("Unknown error");
+  }
+
+  return None();
 }
 
 } // namespace validation {

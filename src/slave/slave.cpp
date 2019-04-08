@@ -167,12 +167,6 @@ using process::UPID;
 
 using process::http::authentication::Principal;
 
-#ifdef __WINDOWS__
-constexpr char MESOS_EXECUTOR[] = "mesos-executor.exe";
-#else
-constexpr char MESOS_EXECUTOR[] = "mesos-executor";
-#endif // __WINDOWS__
-
 namespace mesos {
 namespace internal {
 namespace slave {
@@ -203,6 +197,7 @@ Slave::Slave(const string& id,
              ResourceEstimator* _resourceEstimator,
              QoSController* _qosController,
              SecretGenerator* _secretGenerator,
+             VolumeGidManager* _volumeGidManager,
              const Option<Authorizer*>& _authorizer)
   : ProcessBase(id),
     state(RECOVERING),
@@ -232,6 +227,7 @@ Slave::Slave(const string& id,
     resourceEstimator(_resourceEstimator),
     qosController(_qosController),
     secretGenerator(_secretGenerator),
+    volumeGidManager(_volumeGidManager),
     authorizer(_authorizer),
     resourceVersion(protobuf::createUUID()) {}
 
@@ -641,13 +637,6 @@ void Slave::initialize()
   // agent (re-)registers with the master.
   taskStatusUpdateManager->pause();
   operationStatusUpdateManager.pause();
-
-  operationStatusUpdateManager.initialize(
-      defer(self(), &Self::sendOperationStatusUpdate, lambda::_1),
-      std::bind(
-          &slave::paths::getOperationUpdatesPath,
-          metaDir,
-          lambda::_1));
 
   // Start disk monitoring.
   // NOTE: We send a delayed message here instead of directly calling
@@ -1502,12 +1491,26 @@ void Slave::registered(
       Clock::cancel(agentRegistrationTimer);
 
       taskStatusUpdateManager->resume(); // Resume status updates.
-      operationStatusUpdateManager.resume();
 
       info.mutable_id()->CopyFrom(slaveId); // Store the slave id.
 
       // Create the slave meta directory.
       paths::createSlaveDirectory(metaDir, slaveId);
+
+      // Initialize and resume the operation status update manager.
+      //
+      // NOTE: There is no need to recover the operation status update manager,
+      // because its streams are checkpointed within the slave meta directory
+      // which was just created.
+      operationStatusUpdateManager.initialize(
+          defer(self(), &Self::sendOperationStatusUpdate, lambda::_1),
+          std::bind(
+              &slave::paths::getSlaveOperationUpdatesPath,
+              metaDir,
+              info.id(),
+              lambda::_1));
+
+      operationStatusUpdateManager.resume();
 
       // Checkpoint slave info.
       const string path = paths::getSlaveInfoPath(metaDir, slaveId);
@@ -3066,7 +3069,7 @@ void Slave::__run(
       LOG(INFO) << "Queued " << taskOrTaskGroup(task, taskGroup)
                 << " for executor " << *executor;
 
-      publishResources()
+      publishResources(executor->containerId, executor->allocatedResources())
         .then(defer(self(), [=] {
           return containerizer->update(
               executor->containerId,
@@ -3528,12 +3531,7 @@ void Slave::launchExecutor(
             << "' of framework " << framework->id();
 
   // Launch the container.
-  // NOTE: Since we modify the ExecutorInfo to include the task's
-  // resources when launching the executor, these resources need to be
-  // published before the containerizer preparing them. This should be
-  // revisited after MESOS-600.
-  publishResources(
-      taskInfo.isSome() ? taskInfo->resources() : Option<Resources>::none())
+  publishResources(executor->containerId, resources)
     .then(defer(self(), [=] {
       return containerizer->launch(
           executor->containerId,
@@ -4395,7 +4393,6 @@ Try<Nothing> Slave::syncCheckpointedResources(
 
       // We should proceed only if the directory is removed.
       Try<Nothing> result = os::rmdir(path, true, removeRoot);
-
       if (result.isError()) {
         return Error(
             "Failed to remove persistent volume '" +
@@ -4403,6 +4400,15 @@ Try<Nothing> Slave::syncCheckpointedResources(
             "' at '" + path + "': " + result.error());
       }
     }
+
+#ifndef __WINDOWS__
+    // Deallocate the shared persistent volume's gid. Please note that the
+    // gid is allocated when the shared persistent volume is first used by
+    // a container rather than when it is created.
+    if (volumeGidManager) {
+      volumeGidManager->deallocate(path);
+    }
+#endif // __WINDOWS__
   }
 
   return Nothing();
@@ -4501,47 +4507,113 @@ void Slave::applyOperation(const ApplyOperationMessage& message)
 
 void Slave::reconcileOperations(const ReconcileOperationsMessage& message)
 {
-  bool containsResourceProviderOperations = false;
+  // If the `framework_id` field in the message is set, then this reconciliation
+  // request was initiated by the framework. This means the operations in this
+  // message were not known to the master at the time of reconciliation. If the
+  // resource provider manager doesn't recognize the operation either, then we
+  // will return OPERATION_UNKNOWN.
+  if (message.has_framework_id()) {
+    foreach (
+        const ReconcileOperationsMessage::Operation& operation,
+        message.operations()) {
+      Option<UUID> operationUuid;
+      if (operation.has_operation_uuid()) {
+        operationUuid = operation.operation_uuid();
+      } else if (operation.has_operation_id()) {
+        auto key = std::make_pair(
+            message.framework_id(), operation.operation_id());
+        if (operationIds.contains(key)) {
+          operationUuid = operationIds.at(key);
+        }
+      }
 
-  foreach (
-      const ReconcileOperationsMessage::Operation& operation,
-      message.operations()) {
-    if (operation.has_resource_provider_id()) {
-      containsResourceProviderOperations = true;
-      continue;
+      if (operationUuid.isSome()) {
+        Operation* storedOperation = getOperation(operationUuid.get());
+
+        // If the agent knows this operation, then the reconciliation request
+        // must have raced with an `UpdateSlaveMessage` from the agent. We
+        // satisfy this reconciliation request with the latest stored state of
+        // the operation.
+        if (storedOperation != nullptr) {
+          // Clear the status UUID from the latest status since this update is
+          // not sent reliably and thus does not require acknowledgement.
+          OperationStatus status = storedOperation->latest_status();
+          status.clear_uuid();
+
+          UpdateOperationStatusMessage update =
+            protobuf::createUpdateOperationStatusMessage(
+                operationUuid.get(),
+                status,
+                None(),
+                message.framework_id(),
+                info.id());
+
+          send(master.get(), update);
+
+          continue;
+        }
+      }
+
+      // If the agent doesn't know this operation and the operation includes a
+      // resource provider ID, then we forward the reconciliation to the
+      // resource provider manager to satisfy it based on whether or not the
+      // specified resource provider is known.
+      CHECK_NOTNULL(resourceProviderManager.get())
+        ->reconcileOperations(message);
+    }
+  // If the `framework_id` field in the message is not set, then this
+  // reconciliation was initiated by the master. We help the master reconcile
+  // its in-memory state below. If operations known by the master are not known
+  // by the agent/RP, then we return OPERATION_DROPPED to indicate that the
+  // operation never made it to the agent.
+  } else {
+    bool forwardToResourceProvider = false;
+
+    foreach (
+        const ReconcileOperationsMessage::Operation& operation,
+        message.operations()) {
+      // The `operation_uuid` field should always be set for
+      // master-initiated reconciliations.
+      CHECK(operation.has_operation_uuid());
+
+      if (operation.has_resource_provider_id()) {
+        forwardToResourceProvider = true;
+        continue;
+      }
+
+      // The master reconciles when it notices that an operation is missing from
+      // an `UpdateSlaveMessage`. If we cannot find an operation in the agent
+      // state, we send an update to inform the master. If we do find the
+      // operation, then the master and agent state are consistent and we do not
+      // need to do anything.
+      Operation* storedOperation = getOperation(operation.operation_uuid());
+      if (storedOperation == nullptr) {
+        // For agent default resources, we send best-effort operation status
+        // updates to the master. This is satisfactory because a dropped message
+        // would imply a subsequent agent reregistration, after which an
+        // `UpdateSlaveMessage` would be sent with pending operations.
+        UpdateOperationStatusMessage update =
+          protobuf::createUpdateOperationStatusMessage(
+              operation.operation_uuid(),
+              protobuf::createOperationStatus(
+                  OPERATION_DROPPED,
+                  None(),
+                  None(),
+                  None(),
+                  None(),
+                  info.id()),
+              None(),
+              None(),
+              info.id());
+
+        send(master.get(), update);
+      }
     }
 
-    // The master reconciles when it notices that an operation is missing from
-    // an `UpdateSlaveMessage`. If we cannot find an operation in the agent
-    // state, we send an update to inform the master. If we do find the
-    // operation, then the master and agent state are consistent and we do not
-    // need to do anything.
-    Operation* storedOperation = getOperation(operation.operation_uuid());
-    if (storedOperation == nullptr) {
-      // For agent default resources, we send best-effort operation status
-      // updates to the master. This is satisfactory because a dropped message
-      // would imply a subsequent agent reregistration, after which an
-      // `UpdateSlaveMessage` would be sent with pending operations.
-      UpdateOperationStatusMessage update =
-        protobuf::createUpdateOperationStatusMessage(
-            operation.operation_uuid(),
-            protobuf::createOperationStatus(
-                OPERATION_DROPPED,
-                None(),
-                None(),
-                None(),
-                None(),
-                info.id()),
-            None(),
-            None(),
-            info.id());
-
-      send(master.get(), update);
+    if (forwardToResourceProvider) {
+      CHECK_NOTNULL(resourceProviderManager.get())
+        ->reconcileOperations(message);
     }
-  }
-
-  if (containsResourceProviderOperations) {
-    CHECK_NOTNULL(resourceProviderManager.get())->reconcileOperations(message);
   }
 }
 
@@ -4672,40 +4744,28 @@ void Slave::operationStatusAcknowledgement(
     const AcknowledgeOperationStatusMessage& acknowledgement)
 {
   Operation* operation = getOperation(acknowledgement.operation_uuid());
-  if (operation != nullptr) {
-    // If the operation was on resource provider resources forward the
-    // acknowledgement to the resource provider manager as well.
-    Result<ResourceProviderID> resourceProviderId =
-      getResourceProviderId(operation->info());
 
-    CHECK(!resourceProviderId.isError())
-      << "Could not determine resource provider of operation " << operation
-      << ": " << resourceProviderId.error();
+  if (operation == nullptr) {
+    LOG(WARNING) << "Dropping operation update acknowledgement with"
+      << " status_uuid " << acknowledgement.status_uuid() << " and"
+      << " operation_uuid " << acknowledgement.operation_uuid()
+      << " because the operation was not found";
 
-    if (resourceProviderId.isSome()) {
-      CHECK_NOTNULL(resourceProviderManager.get())
-        ->acknowledgeOperationStatus(acknowledgement);
-    } else {
-      // Acknowledgement was for an operation on the agent's default resources
-      auto statusUuid = id::UUID::fromBytes(
-          acknowledgement.status_uuid().value());
+    return;
+  }
 
-      auto operationUuid = id::UUID::fromBytes(
-          acknowledgement.operation_uuid().value());
+  // If the operation was on resource provider resources forward the
+  // acknowledgement to the resource provider manager as well.
+  Result<ResourceProviderID> resourceProviderId =
+    getResourceProviderId(operation->info());
 
-      if (operationUuid.isError() || statusUuid.isError()) {
-        LOG(WARNING) << "Dropping acknowledgement for operation " << operation
-                     << " with provided operation uuid "
-                     << acknowledgement.operation_uuid().value()
-                     << " and status uuid "
-                     << acknowledgement.status_uuid().value() << ".";
-        return;
-      }
+  CHECK(!resourceProviderId.isError())
+    << "Could not determine resource provider of operation " << operation
+    << ": " << resourceProviderId.error();
 
-      operationStatusUpdateManager.acknowledgement(
-          operationUuid.get(),
-          statusUuid.get());
-    }
+  if (resourceProviderId.isSome()) {
+    CHECK_NOTNULL(resourceProviderManager.get())
+      ->acknowledgeOperationStatus(acknowledgement);
 
     CHECK(operation->statuses_size() > 0);
     if (protobuf::isTerminalState(
@@ -4716,12 +4776,64 @@ void Slave::operationStatusAcknowledgement(
       // cause the agent to add the operation back.
       removeOperation(operation);
     }
-  } else {
-    LOG(WARNING) << "Dropping operation update acknowledgement with"
-                 << " status_uuid " << acknowledgement.status_uuid() << " and"
-                 << " operation_uuid " << acknowledgement.operation_uuid()
-                 << " because the operation was not found";
+
+    return;
   }
+
+  // Acknowledgement was for an operation on the agent's default resources.
+  auto statusUuid = id::UUID::fromBytes(
+      acknowledgement.status_uuid().value());
+
+  auto operationUuid = id::UUID::fromBytes(
+      acknowledgement.operation_uuid().value());
+
+  if (operationUuid.isError() || statusUuid.isError()) {
+    LOG(WARNING) << "Dropping acknowledgement for operation " << operation
+      << " with provided operation uuid "
+      << acknowledgement.operation_uuid().value()
+      << " and status uuid "
+      << acknowledgement.status_uuid().value() << ".";
+    return;
+  }
+
+  auto err = [](const id::UUID& uuid, const string& message) {
+    LOG(ERROR)
+      << "Failed to acknowledge status update for operation (uuid: " << uuid
+      << "): " << message;
+  };
+
+  // NOTE: It is possible that an incoming acknowledgement races with an
+  // outgoing retry of status update, and then a duplicated
+  // acknowledgement will be received. In this case, the following call
+  // will fail, so we just leave an error log.
+  operationStatusUpdateManager
+    .acknowledgement(operationUuid.get(), statusUuid.get())
+    .then(defer(self(), [=](bool continuation) {
+      if (!continuation) {
+        removeOperation(operation);
+
+        // Garbage collect the status update stream.
+
+        const string path = slave::paths::getSlaveOperationPath(
+            metaDir,
+            info.id(),
+            operationUuid.get());
+
+        // NOTE: We check if the path exists since we do not checkpoint some
+        // status updates, such as OPERATION_DROPPED.
+        if (os::exists(path)) {
+          Try<Nothing> rmdir = os::rmdir(path);
+          if (rmdir.isError()) {
+            LOG(ERROR) << "Failed to remove operation status update stream "
+                       << "directory '" << path << "': " << rmdir.error();
+          }
+        }
+      }
+
+      return Nothing();
+    }))
+    .onFailed(std::bind(err, operationUuid.get(), lambda::_1))
+    .onDiscarded(std::bind(err, operationUuid.get(), "future discarded"));
 }
 
 
@@ -4912,7 +5024,7 @@ void Slave::subscribe(
         }
       }
 
-      publishResources()
+      publishResources(executor->containerId, executor->allocatedResources())
         .then(defer(self(), [=] {
           return containerizer->update(
               executor->containerId,
@@ -5069,7 +5181,7 @@ void Slave::registerExecutor(
         }
       }
 
-      publishResources()
+      publishResources(executor->containerId, executor->allocatedResources())
         .then(defer(self(), [=] {
           return containerizer->update(
               executor->containerId,
@@ -7311,25 +7423,59 @@ Future<Nothing> Slave::recover(const Try<state::State>& state)
     }
   }
 
-  return taskStatusUpdateManager->recover(metaDir, slaveState)
+  return _recoverVolumeGidManager(state->rebooted)
+    .then(defer(self(), &Slave::_recoverTaskStatusUpdates, slaveState))
     .then(defer(self(), &Slave::_recoverContainerizer, slaveState))
-    .then(defer(self(), &Slave::_recoverOperations, slaveState))
-    .then(defer(self(), &Slave::__recoverOperations, lambda::_1));
+    .then(defer(self(), &Slave::_recoverOperations, slaveState));
+}
+
+
+Future<Nothing> Slave::_recoverVolumeGidManager(bool rebooted)
+{
+#ifndef __WINDOWS__
+  if (volumeGidManager) {
+    return volumeGidManager->recover(rebooted);
+  }
+  return Nothing();
+#else
+  return Nothing();
+#endif // __WINDOWS__
+}
+
+
+Future<Option<SlaveState>> Slave::_recoverTaskStatusUpdates(
+    const Option<SlaveState>& state)
+{
+  return taskStatusUpdateManager->recover(metaDir, state)
+    .then([state]() -> Future<Option<SlaveState>> {
+      return state;
+    });
 }
 
 
 Future<Nothing> Slave::_recoverContainerizer(
-    const Option<state::SlaveState>& state)
+    const Option<SlaveState>& state)
 {
   return containerizer->recover(state);
 }
 
 
-Future<OperationStatusUpdateManagerState> Slave::_recoverOperations(
+Future<Nothing> Slave::_recoverOperations(
     const Option<state::SlaveState>& state)
 {
-  list<id::UUID> operationUuids;
-  if (state.isSome() && state->operations.isSome()) {
+  if (state.isNone()) {
+    return Nothing();
+  }
+
+  operationStatusUpdateManager.initialize(
+      defer(self(), &Self::sendOperationStatusUpdate, lambda::_1),
+      std::bind(
+          &slave::paths::getSlaveOperationUpdatesPath,
+          metaDir,
+          info.id(),
+          lambda::_1));
+
+  if (state->operations.isSome()) {
     foreach (const Operation& operation, state->operations.get()) {
       Result<ResourceProviderID> resourceProviderId =
         getResourceProviderId(operation.info());
@@ -7337,14 +7483,68 @@ Future<OperationStatusUpdateManagerState> Slave::_recoverOperations(
       // Only operations affecting agent default resources are checkpointed.
       CHECK(resourceProviderId.isNone());
 
-      operationUuids.push_back(
-          CHECK_NOTERROR(id::UUID::fromBytes(operation.uuid().value())));
-
       addOperation(new Operation(operation));
     }
   }
 
-  return operationStatusUpdateManager.recover(operationUuids, flags.strict);
+  // Walk the operation status update streams directories in order to generate
+  // the list of streams to recover.
+  //
+  // NOTE: It is possible for the agent to fail over right after having
+  // checkpointed an operation in a `ResourceState` message, but before having
+  // created the corresponding stream.
+  //
+  // In that case the checkpointed message will contain the operation, but the
+  // corresponding directory for the operation status update stream will not
+  // exist.
+  //
+  // Since the SUM recovery process will return an error if invoked with an
+  // operation ID for which a stream hasn't been created, we can't extract the
+  // list of streams to recover from the content of the checkpointed
+  // `ResourceState` message.
+  Try<list<string>> operationPaths =
+    slave::paths::getSlaveOperationPaths(metaDir, info.id());
+
+  if (operationPaths.isError()) {
+    return Failure(
+        "Failed to find operation status update streams: " +
+        operationPaths.error());
+  }
+
+  list<id::UUID> operationUuids;
+  foreach (const string& path, operationPaths.get()) {
+    Try<id::UUID> uuid =
+      slave::paths::parseSlaveOperationPath(metaDir, info.id(), path);
+
+    if (uuid.isError()) {
+      return Failure(
+          "Failed to parse operation status update stream path '" + path +
+          "': " + uuid.error());
+    }
+
+    UUID uuid_;
+    uuid_.set_value(uuid->toBytes());
+
+    // NOTE: This could happen if we failed to remove the operation path before.
+    if (!operations.contains(uuid_)) {
+      LOG(WARNING)
+        << "Garbage collecting status update stream for unknown operation"
+        << " (uuid: " << uuid.get() << ")";
+
+      Try<Nothing> rmdir = os::rmdir(path);
+      if (rmdir.isError()) {
+        LOG(ERROR)
+          << "Failed to remove directory '" << path << "': " << rmdir.error();
+      }
+
+      continue;
+    }
+
+    operationUuids.emplace_back(std::move(uuid.get()));
+  }
+
+  return operationStatusUpdateManager.recover(operationUuids, flags.strict)
+    .then(defer(self(), &Slave::__recoverOperations, lambda::_1));
 }
 
 
@@ -7365,9 +7565,41 @@ Future<Nothing> Slave::__recoverOperations(
     metrics.recovery_errors += state->errors;
   }
 
-  foreachpair (const UUID& uuid,
-               Operation* operation,
-               operations) {
+  // Clean up operations with terminated streams.
+  //
+  // These are operations with terminal updates that have already been
+  // acknowledged. They could still be checkpointed if the agent failed
+  // over just before removing them from its state.
+  using StreamState = typename OperationStatusUpdateManagerState::StreamState;
+  vector<id::UUID> completedOperations;
+  foreachpair (const id::UUID& uuid,
+               const Option<StreamState>& stream,
+               state->streams) {
+    if (stream.isSome() && stream->terminated) {
+      UUID operationUuid;
+      operationUuid.set_value(uuid.toBytes());
+
+      Operation* operation = getOperation(operationUuid);
+      if (operation != nullptr) {
+        removeOperation(operation);
+        completedOperations.push_back(uuid);
+      }
+    }
+  }
+
+  // Garbage collect the operation streams.
+  foreach (const id::UUID& uuid, completedOperations) {
+    const string path =
+      slave::paths::getSlaveOperationPath(metaDir, info.id(), uuid);
+
+    Try<Nothing> rmdir = os::rmdir(path);
+    if (rmdir.isError()) {
+      LOG(ERROR) << "Failed to remove operation status update stream "
+                 << "directory '" << path << "': " << rmdir.error();
+    }
+  }
+
+  foreachpair (const UUID& uuid, Operation* operation, operations) {
     const id::UUID operationUuid(
         CHECK_NOTERROR(id::UUID::fromBytes(uuid.value())));
 
@@ -7379,8 +7611,10 @@ Future<Nothing> Slave::__recoverOperations(
         : Option<FrameworkID>::none();
 
     if (operation->latest_status().state() == OPERATION_PENDING) {
-      // The agent failed over before creating an `OPERATION_FINISHED` update.
-      CHECK(!state->streams.contains(operationUuid));
+      // The agent failed over before the checkpoint of the
+      // `OPERATION_FINISHED` update completed.
+      CHECK(state->streams.get(operationUuid).isNone() ||
+            state->streams.get(operationUuid)->isNone());
 
       Option<OperationID> operationId =
         operation->info().has_id()
@@ -8090,6 +8324,19 @@ void Slave::handleResourceProviderMessage(
       Operation* operation = getOperation(operationUUID);
 
       if (operation != nullptr) {
+        // It is possible for the resource provider to forget or incorrectly
+        // copy the OperationID in its status update. We make sure the ID
+        // is filled in with the correct value before proceeding.
+        if (operation->info().has_id()) {
+          update.mutable_status()->mutable_operation_id()
+            ->CopyFrom(operation->info().id());
+
+          if (update.has_latest_status()) {
+            update.mutable_latest_status()->mutable_operation_id()
+              ->CopyFrom(operation->info().id());
+          }
+        }
+
         // The agent might not know about the operation in the
         // following cases:
         //
@@ -8308,6 +8555,12 @@ void Slave::addOperation(Operation* operation)
 {
   operations.put(operation->uuid(), operation);
 
+  if (operation->info().has_id() && operation->has_framework_id()) {
+    operationIds.put(
+        std::make_pair(operation->framework_id(), operation->info().id()),
+        operation->uuid());
+  }
+
   Result<ResourceProviderID> resourceProviderId =
     getResourceProviderId(operation->info());
 
@@ -8458,6 +8711,11 @@ void Slave::removeOperation(Operation* operation)
   CHECK(operations.contains(uuid))
     << "Unknown operation (uuid: " << uuid << ")";
 
+  if (operation->info().has_id() && operation->has_framework_id()) {
+    operationIds.erase(
+        std::make_pair(operation->framework_id(), operation->info().id()));
+  }
+
   operations.erase(uuid);
   delete operation;
 
@@ -8582,48 +8840,71 @@ void Slave::apply(Operation* operation)
 
 
 Future<Nothing> Slave::publishResources(
-    const Option<Resources>& additionalResources)
+    const ContainerID& containerId, const Resources& resources)
 {
-  // If the resource provider manager has not been created yet no resource
-  // providers have been added and we do not need to publish anything.
-  if (resourceProviderManager == nullptr) {
-    // We check whether the passed additional resources are compatible
-    // with the expectation that no resource provider resources are in
-    // use, yet. This is not an exhaustive consistency check.
-    if (additionalResources.isSome()) {
-      foreach (const Resource& resource, additionalResources.get()) {
-        CHECK(!resource.has_provider_id())
-          << "Cannot publish resource provider resources "
-          << additionalResources.get()
-          << " until resource providers have subscribed";
+  hashset<ResourceProviderID> resourceProviderIds;
+  foreach (const Resource& resource, resources) {
+    if (resource.has_provider_id()) {
+      resourceProviderIds.insert(resource.provider_id());
+    }
+  }
+
+  vector<Future<Nothing>> futures;
+  foreach (const ResourceProviderID& resourceProviderId, resourceProviderIds) {
+    auto hasResourceProviderId = [&](const Resource& resource) {
+      return resource.has_provider_id() &&
+             resource.provider_id() == resourceProviderId;
+    };
+
+    // NOTE: For resources providers that serve quantity-based resources without
+    // identifier (such as cpus and mem), we cannot achieve idempotency with
+    // diff-based resource publishing, so we have to implement the "ensure-all"
+    // semantics, and always calculate the total resources to publish.
+    Option<Resources> containerResources;
+    Resources complementaryResources;
+    foreachvalue (const Framework* framework, frameworks) {
+      foreachvalue (const Executor* executor, framework->executors) {
+        if (executor->containerId == containerId) {
+          containerResources = resources.filter(hasResourceProviderId);
+        } else {
+          complementaryResources +=
+            executor->allocatedResources().filter(hasResourceProviderId);
+        }
       }
     }
 
-    return Nothing();
-  }
+    if (containerResources.isNone()) {
+      // NOTE: This actually should not happen, as the callers have already
+      // ensured the existence of the executor before calling this function
+      // synchronously. However we still treat this as a nonfatal error since
+      // this might change in the future.
+      LOG(WARNING) << "Ignoring publishing resources for container "
+                   << containerId << ": Executor cannot be found";
 
-  Resources resources;
-
-  // NOTE: For resources providers that serve quantity-based resources
-  // without any identifiers (such as memory), it is very hard to keep
-  // track of published resources. So instead of implementing diff-based
-  // resource publishing, we implement an "ensure-all" semantics, and
-  // always calculate the total resources that need to remain published.
-  foreachvalue (const Framework* framework, frameworks) {
-    // NOTE: We do not call `framework->allocatedResource()` here
-    // because we do not want to publsh resources for pending tasks that
-    // have not been authorized yet.
-    foreachvalue (const Executor* executor, framework->executors) {
-      resources += executor->allocatedResources();
+      return Nothing();
     }
+
+    // Since we already have resources from any resource provider in the
+    // resource pool, the resource provider manager must have been created.
+    futures.push_back(
+        CHECK_NOTNULL(resourceProviderManager.get())
+          ->publishResources(containerResources.get() + complementaryResources)
+          .repair([=](const Future<Nothing>& future) -> Future<Nothing> {
+            // TODO(chhsiao): Consider surfacing the set of published resources
+            // and only fail if `published - complementaryResources` does not
+            // contain `containerResources`.
+            return Failure(
+                "Failed to publish resources '" +
+                stringify(containerResources.get()) + "' for container " +
+                stringify(containerId) + ": " + future.failure());
+          }));
   }
 
-  if (additionalResources.isSome()) {
-    resources += additionalResources.get();
-  }
-
-  return CHECK_NOTNULL(resourceProviderManager.get())
-    ->publishResources(resources);
+  // NOTE: Resource cleanups (e.g., unpublishing) are not performed at task
+  // completion, but rather done __lazily__ when necessary. This is not just an
+  // optimization but required because resource allocations are tied to task
+  // lifecycles. As a result, no cleanup is needed here if any future fails.
+  return collect(futures).then([] { return Nothing(); });
 }
 
 
